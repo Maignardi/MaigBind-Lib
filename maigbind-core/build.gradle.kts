@@ -48,7 +48,7 @@ kotlin {
 }
 
 mavenPublishing {
-    publishToMavenCentral()
+    publishToMavenCentral(automaticRelease = true)
     if (providers.gradleProperty("signingInMemoryKey").isPresent ||
         providers.gradleProperty("signing.keyId").isPresent
     ) {

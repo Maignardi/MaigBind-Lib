@@ -41,24 +41,24 @@ MaigBind replaces that pattern with an end-to-end cryptographic protocol:
 
 ### 1. Dependencies
 
-> **Publishing note:** Maven Central publication under `io.github.maignardi` is configured via `vanniktech-maven-publish` (`0.2.0-SNAPSHOT`). Until the first Maven Central release tag is published, install locally with `./gradlew publishToMavenLocal` and enable `mavenLocal()`.
+> **Publishing note:** `VERSION_NAME` is `0.1.0` (`io.github.maignardi`), configured with `vanniktech-maven-publish` (`automaticRelease = true`) and `.github/workflows/release.yml` for Maven Central. Until the release workflow runs with your Sonatype Central Portal & GPG secrets on a `v*` tag, install locally with `./gradlew publishToMavenLocal` and enable `mavenLocal()`.
 
 ```kotlin
 // settings.gradle.kts / repositories
 repositories {
-    mavenLocal() // while using 0.2.0-SNAPSHOT
+    mavenLocal() // needed only prior to Maven Central sync
     google()
     mavenCentral()
 }
 
 // Android app
 dependencies {
-    implementation("io.github.maignardi:maigbind-android:0.2.0-SNAPSHOT")
+    implementation("io.github.maignardi:maigbind-android:0.1.0")
 }
 
 // JVM backend
 dependencies {
-    implementation("io.github.maignardi:maigbind-verifier:0.2.0-SNAPSHOT")
+    implementation("io.github.maignardi:maigbind-verifier:0.1.0")
 }
 ```
 
