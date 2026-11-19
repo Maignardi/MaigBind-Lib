@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run quality checks and unit tests
+        run: ./gradlew ktlintCheck detekt :maigbind-core:allTests :maigbind-verifier:test :maigbind-android:testDebugUnitTest :sample-server:test :sample-app:testDebugUnitTest
+
+      - name: Generate Dokka documentation
+        run: ./gradlew :maigbind-core:dokkaGeneratePublicationHtml :maigbind-verifier:dokkaGeneratePublicationHtml :maigbind-android:dokkaGeneratePublicationHtml

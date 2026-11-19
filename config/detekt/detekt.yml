@@ -1,0 +1,36 @@
+complexity:
+  LongMethod:
+    active: true
+    allowedLines: 80
+  CyclomaticComplexMethod:
+    active: true
+    allowedComplexity: 18
+  LargeClass:
+    active: true
+    allowedLines: 600
+  TooManyFunctions:
+    active: false
+  LongParameterList:
+    active: false
+
+naming:
+  FunctionNaming:
+    ignoreAnnotated:
+      - Composable
+
+style:
+  MagicNumber:
+    active: false
+  MaxLineLength:
+    active: true
+    maxLineLength: 120
+  ReturnCount:
+    active: false
+  ThrowsCount:
+    active: false
+  WildcardImport:
+    active: false
+
+exceptions:
+  TooGenericExceptionCaught:
+    active: false
