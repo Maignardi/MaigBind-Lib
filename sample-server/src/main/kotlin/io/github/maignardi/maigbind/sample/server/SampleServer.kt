@@ -88,6 +88,7 @@ public data class RevokeBindingHttpResponse(
 @Serializable
 public data class ActiveBindingHttpResponse(
     val accountId: String,
+    val activeKeyIds: List<String> = emptyList(),
     val activeKeyId: String? = null,
     val bindingId: String? = null,
 )
@@ -180,13 +181,15 @@ private fun Route.enrollmentRoutes(
         val accountId =
             call.request.queryParameters["accountId"]?.takeIf { it.isNotBlank() }
                 ?: throw IllegalArgumentException("Query parameter 'accountId' is required")
-        val active = verifier.getActiveBindings(accountId).firstOrNull()
+        val actives = verifier.getActiveBindings(accountId)
+        val first = actives.firstOrNull()
         call.respond(
             HttpStatusCode.OK,
             ActiveBindingHttpResponse(
                 accountId = accountId,
-                activeKeyId = active?.keyId,
-                bindingId = active?.bindingId,
+                activeKeyIds = actives.map { it.keyId },
+                activeKeyId = first?.keyId,
+                bindingId = first?.bindingId,
             ),
         )
     }

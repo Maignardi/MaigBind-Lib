@@ -197,7 +197,7 @@ public interface BindingStore {
      *
      * @return the number of expired pending bindings purged.
      */
-    public fun purgeExpiredPending(nowMillis: Long): Int = 0
+    public fun purgeExpiredPending(nowMillis: Long): Int
 }
 
 /** Thread-safe in-memory [BindingStore]. */

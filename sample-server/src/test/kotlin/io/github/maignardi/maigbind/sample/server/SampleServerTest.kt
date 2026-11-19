@@ -140,12 +140,15 @@ class SampleServerTest {
 
             val initial = client.get("/bindings/active?accountId=acct-99")
             assertEquals(HttpStatusCode.OK, initial.status)
-            assertEquals(null, json.decodeFromString<ActiveBindingHttpResponse>(initial.bodyAsText()).activeKeyId)
+            val initialBody = json.decodeFromString<ActiveBindingHttpResponse>(initial.bodyAsText())
+            assertEquals(emptyList<String>(), initialBody.activeKeyIds)
+            assertEquals(null, initialBody.activeKeyId)
 
             val (_, keyId) = enrollViaHttp(client, rootCert, rootKp)
             val afterEnroll = client.get("/bindings/active?accountId=acct-99")
             assertEquals(HttpStatusCode.OK, afterEnroll.status)
             val activeResp = json.decodeFromString<ActiveBindingHttpResponse>(afterEnroll.bodyAsText())
+            assertEquals(listOf(keyId), activeResp.activeKeyIds)
             assertEquals(keyId, activeResp.activeKeyId)
 
             val revokeResp =
@@ -157,7 +160,9 @@ class SampleServerTest {
             assertEquals(1, json.decodeFromString<RevokeBindingHttpResponse>(revokeResp.bodyAsText()).revokedCount)
 
             val afterRevoke = client.get("/bindings/active?accountId=acct-99")
-            assertEquals(null, json.decodeFromString<ActiveBindingHttpResponse>(afterRevoke.bodyAsText()).activeKeyId)
+            val afterRevokeBody = json.decodeFromString<ActiveBindingHttpResponse>(afterRevoke.bodyAsText())
+            assertEquals(emptyList<String>(), afterRevokeBody.activeKeyIds)
+            assertEquals(null, afterRevokeBody.activeKeyId)
         }
 
     private fun createRkpRootCa(): Pair<X509Certificate, KeyPair> {

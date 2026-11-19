@@ -12,8 +12,8 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
-import io.github.maignardi.maigbind.core.Base64Url
 import io.github.maignardi.maigbind.core.SecurityBacking
+import io.github.maignardi.maigbind.core.toHexString
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -22,9 +22,11 @@ import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.ProviderException
-import java.security.SecureRandom
 import java.security.Signature
 import java.security.spec.ECGenParameterSpec
+import javax.crypto.KeyGenerator
+import javax.crypto.Mac
+import javax.crypto.SecretKey
 import kotlin.coroutines.resume
 
 /**
@@ -43,6 +45,42 @@ import kotlin.coroutines.resume
  *   https://developer.android.com/reference/android/security/keystore/KeyGenParameterSpec.Builder#setDevicePropertiesAttestationIncluded(boolean)
  */
 internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
+    private val hmacLock = Any()
+
+    override fun computeAccountHash(accountId: String): String {
+        val secretKey = getOrCreateAliasHmacKey()
+        val mac =
+            Mac.getInstance(HMAC_ALGORITHM).apply {
+                init(secretKey)
+            }
+        return mac.doFinal(accountId.encodeToByteArray()).toHexString().take(24)
+    }
+
+    private fun getOrCreateAliasHmacKey(): SecretKey =
+        synchronized(hmacLock) {
+            val ks = loadKeyStore()
+            if (ks.containsAlias(HMAC_KEY_ALIAS)) {
+                val existing =
+                    runCatching { ks.getKey(HMAC_KEY_ALIAS, null) as? SecretKey }
+                        .getOrElse { ex ->
+                            throw IllegalStateException(
+                                "Keystore alias HMAC key '$HMAC_KEY_ALIAS' is corrupted; " +
+                                    "refusing to regenerate to avoid orphaning enrolled keys",
+                                ex,
+                            )
+                        }
+                return@synchronized existing
+                    ?: throw IllegalStateException(
+                        "Keystore alias HMAC key '$HMAC_KEY_ALIAS' returned null; " +
+                            "refusing to regenerate to avoid orphaning enrolled keys",
+                    )
+            }
+            val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256, ANDROID_KEYSTORE)
+            val spec = KeyGenParameterSpec.Builder(HMAC_KEY_ALIAS, KeyProperties.PURPOSE_SIGN).build()
+            keyGenerator.init(spec)
+            keyGenerator.generateKey()
+        }
+
     override fun generateHardwareKey(
         alias: String,
         attestationChallenge: ByteArray,
@@ -215,12 +253,16 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
 
     private companion object {
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        const val HMAC_KEY_ALIAS = "maigbind:alias_hmac_v1"
+        const val HMAC_ALGORITHM = "HmacSHA256"
     }
 }
 
 /**
- * SharedPreferences-backed alias slot tracker keyed strictly by per-install salted SHA-256 account
- * hashes (mitigating brute-force reversal of low-entropy identifiers such as national IDs/CPFs).
+ * SharedPreferences-backed alias slot tracker keyed by non-exportable Keystore-HMAC-SHA256
+ * account hashes. Because the HMAC key never leaves `AndroidKeyStore`, an attacker with
+ * filesystem access to `maigbind_slots.xml` cannot brute-force low-entropy identifiers such as
+ * national IDs/CPFs offline.
  *
  * Host apps with Android Auto Backup enabled should exclude `maigbind_slots.xml` in
  * `data_extraction_rules.xml` / `backup_rules.xml`.
@@ -230,73 +272,51 @@ internal class SharedPrefsKeyAliasSlotStore(
 ) : KeyAliasSlotStore {
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    private val saltLock = Any()
-
-    override fun getOrCreateInstallSalt(): ByteArray {
-        val existing = prefs.getString(KEY_INSTALL_SALT, null)
-        if (existing != null) {
-            return runCatching { Base64Url.decode(existing) }.getOrNull()?.takeIf { it.size == 32 }
-                ?: generateAndStoreSalt()
-        }
-        return synchronized(saltLock) {
-            val rechecked = prefs.getString(KEY_INSTALL_SALT, null)
-            if (rechecked != null) {
-                runCatching { Base64Url.decode(rechecked) }.getOrNull()?.takeIf { it.size == 32 }
-                    ?: generateAndStoreSalt()
-            } else {
-                generateAndStoreSalt()
-            }
-        }
-    }
-
-    private fun generateAndStoreSalt(): ByteArray {
-        val salt = ByteArray(32).also { SecureRandom().nextBytes(it) }
-        prefs.edit().putString(KEY_INSTALL_SALT, Base64Url.encode(salt)).commit()
-        return salt
-    }
 
     override fun getActiveAlias(accountHash: String): String? = prefs.getString("active:$accountHash", null)
 
     override fun setActiveAlias(
         accountHash: String,
         alias: String?,
-    ) {
+    ): Boolean =
         prefs
             .edit()
             .apply {
                 if (alias == null) remove("active:$accountHash") else putString("active:$accountHash", alias)
             }.commit()
-    }
 
     override fun getPendingAlias(accountHash: String): String? = prefs.getString("pending:$accountHash", null)
 
     override fun setPendingAlias(
         accountHash: String,
         alias: String?,
-    ) {
+    ): Boolean =
         prefs
             .edit()
             .apply {
                 if (alias == null) remove("pending:$accountHash") else putString("pending:$accountHash", alias)
             }.commit()
-    }
 
-    override fun promotePendingToActive(accountHash: String): Pair<String?, String?> {
-        val pending = prefs.getString("pending:$accountHash", null) ?: return null to null
+    override fun promotePendingToActive(accountHash: String): SlotPromotionResult {
+        val pending = prefs.getString("pending:$accountHash", null) ?: return SlotPromotionResult.NothingPending
         val previousActive = prefs.getString("active:$accountHash", null)
         // Commit both updates in a single atomic transaction so a process crash cannot leave
         // active == pending and allow abortPendingEnrollment() to delete the active key.
-        prefs
-            .edit()
-            .putString("active:$accountHash", pending)
-            .remove("pending:$accountHash")
-            .commit()
-        return pending to previousActive
+        val committed =
+            prefs
+                .edit()
+                .putString("active:$accountHash", pending)
+                .remove("pending:$accountHash")
+                .commit()
+        return if (committed) {
+            SlotPromotionResult.Promoted(newActiveAlias = pending, previousActiveAlias = previousActive)
+        } else {
+            SlotPromotionResult.CommitFailed
+        }
     }
 
     private companion object {
         const val PREFS_NAME = "maigbind_slots"
-        const val KEY_INSTALL_SALT = "install_salt"
     }
 }
 

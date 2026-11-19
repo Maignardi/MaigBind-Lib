@@ -13,11 +13,9 @@ import io.github.maignardi.maigbind.core.EnrollmentRequest
 import io.github.maignardi.maigbind.core.MaigBindError
 import io.github.maignardi.maigbind.core.MaigBindResult
 import io.github.maignardi.maigbind.core.PromptText
-import io.github.maignardi.maigbind.core.Sha256
 import io.github.maignardi.maigbind.core.SignedPayload
 import io.github.maignardi.maigbind.core.TransactionPayload
 import io.github.maignardi.maigbind.core.computeKeyId
-import io.github.maignardi.maigbind.core.toHexString
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.security.PrivateKey
@@ -27,10 +25,10 @@ import java.util.UUID
 /**
  * Android client SDK for MaigBind.
  *
- * Generates non-exportable EC P-256 keys in StrongBox/TEE under per-install salted SHA-256
- * aliases (protecting even low-entropy identifiers like national IDs/CPFs from brute-force
- * reversal), bound to `BIOMETRIC_STRONG` per-use authentication (`CryptoObject`), and signs
- * canonical CBOR payloads for server-side verification.
+ * Generates non-exportable EC P-256 keys in StrongBox/TEE under Keystore-backed HMAC-SHA256
+ * aliases (preventing offline brute-force reversal of low-entropy identifiers such as national
+ * IDs/CPFs from `SharedPreferences` alone), bound to `BIOMETRIC_STRONG` per-use authentication
+ * (`CryptoObject`), and signs canonical CBOR payloads for server-side verification.
  *
  * Key lifecycle:
  * - Every [enroll] call (including initial enrollment) stages the newly generated key in a
@@ -39,7 +37,7 @@ import java.util.UUID
  * - Once the server confirms `ACTIVE`, call [activatePendingEnrollment] to atomically promote the
  *   pending slot to `active` and delete any superseded key (or [abortPendingEnrollment] on failure).
  * - If the app crashes between server `ACTIVE` and [activatePendingEnrollment], call
- *   [reconcileActiveKey] on startup with the `keyId` reported by your backend.
+ *   [reconcileActiveKey] on startup with the active `keyIds` returned by a successful server query.
  */
 public class MaigBind internal constructor(
     private val config: MaigBindConfig,
@@ -84,7 +82,8 @@ public class MaigBind internal constructor(
     public suspend fun getPendingKeyId(accountId: String): String? =
         withContext(Dispatchers.IO) {
             if (accountId.isBlank()) return@withContext null
-            val alias = aliasSlotStore.getPendingAlias(saltedAccountHash(accountId)) ?: return@withContext null
+            val hash = keyStoreGateway.computeAccountHash(accountId)
+            val alias = aliasSlotStore.getPendingAlias(hash) ?: return@withContext null
             keyStoreGateway.getPublicKeySpkiOrNull(alias)?.let(::computeKeyId)
         }
 
@@ -114,11 +113,10 @@ public class MaigBind internal constructor(
                 return@withContext MaigBindResult.Failure(capabilityError)
             }
 
-            val hash = saltedAccountHash(accountId)
-            val currentActive = aliasSlotStore.getActiveAlias(hash)
-            val newAlias = freshAliasFor(hash)
-
             return@withContext try {
+                val hash = keyStoreGateway.computeAccountHash(accountId)
+                val currentActive = aliasSlotStore.getActiveAlias(hash)
+                val newAlias = freshAliasFor(hash)
                 val material =
                     keyStoreGateway.generateHardwareKey(
                         alias = newAlias,
@@ -131,7 +129,12 @@ public class MaigBind internal constructor(
                         runCatching { keyStoreGateway.deleteKey(oldPending) }
                     }
                 }
-                aliasSlotStore.setPendingAlias(hash, newAlias)
+                if (!aliasSlotStore.setPendingAlias(hash, newAlias)) {
+                    runCatching { keyStoreGateway.deleteKey(newAlias) }
+                    return@withContext MaigBindResult.Failure(
+                        MaigBindError.PlatformFailure("Failed to persist pending enrollment key slot"),
+                    )
+                }
 
                 MaigBindResult.Success(
                     EnrollmentRequest(
@@ -168,14 +171,25 @@ public class MaigBind internal constructor(
                 MaigBindError.InvalidInput("bindingId, accountId, and popChallengeBase64Url must not be blank"),
             )
         }
-        val hash = saltedAccountHash(accountId)
-        val pendingAlias =
-            aliasSlotStore.getPendingAlias(hash)
-                ?: return MaigBindResult.Failure(MaigBindError.NotEnrolled(accountId))
-        val spki =
-            withContext(Dispatchers.IO) { keyStoreGateway.getPublicKeySpkiOrNull(pendingAlias) }
-                ?: return MaigBindResult.Failure(MaigBindError.NotEnrolled(accountId))
-        val keyId = computeKeyId(spki)
+        val (pendingAlias, keyId) =
+            when (
+                val resolved =
+                    withContext(Dispatchers.IO) {
+                        runCatching {
+                            val hash = keyStoreGateway.computeAccountHash(accountId)
+                            val alias =
+                                aliasSlotStore.getPendingAlias(hash)
+                                    ?: return@runCatching MaigBindResult.Failure(MaigBindError.NotEnrolled(accountId))
+                            val spki =
+                                keyStoreGateway.getPublicKeySpkiOrNull(alias)
+                                    ?: return@runCatching MaigBindResult.Failure(MaigBindError.NotEnrolled(accountId))
+                            MaigBindResult.Success(alias to computeKeyId(spki))
+                        }.getOrElse { ex -> MaigBindResult.Failure(mapPlatformException(ex)) }
+                    }
+            ) {
+                is MaigBindResult.Failure -> return resolved
+                is MaigBindResult.Success -> resolved.value
+            }
 
         val popPayload =
             EnrollmentPoPPayload(
@@ -203,19 +217,24 @@ public class MaigBind internal constructor(
 
     /**
      * Atomically promotes the staged `pending` key to `active` for [accountId] after the server
-     * confirms `EnrollmentStatus.ACTIVE`, and deletes any superseded active key from Keystore.
+     * confirms `EnrollmentStatus.ACTIVE`, and deletes any superseded active key from Keystore only
+     * if preference persistence succeeds.
      */
     public suspend fun activatePendingEnrollment(accountId: String): MaigBindResult<Unit> =
         withContext(Dispatchers.IO) {
             if (accountId.isBlank()) {
                 return@withContext MaigBindResult.Failure(MaigBindError.InvalidInput("accountId must not be blank"))
             }
-            val hash = saltedAccountHash(accountId)
-            val (promoted, previousActive) = aliasSlotStore.promotePendingToActive(hash)
-            if (promoted != null && previousActive != null && previousActive != promoted) {
-                runCatching { keyStoreGateway.deleteKey(previousActive) }
+            try {
+                val hash = keyStoreGateway.computeAccountHash(accountId)
+                when (finalizePromotion(aliasSlotStore.promotePendingToActive(hash))) {
+                    is MaigBindResult.Failure ->
+                        MaigBindResult.Failure(MaigBindError.PlatformFailure("Failed to persist key slot promotion"))
+                    is MaigBindResult.Success -> MaigBindResult.Success(Unit)
+                }
+            } catch (ex: Exception) {
+                MaigBindResult.Failure(mapPlatformException(ex))
             }
-            MaigBindResult.Success(Unit)
         }
 
     /**
@@ -227,54 +246,90 @@ public class MaigBind internal constructor(
             if (accountId.isBlank()) {
                 return@withContext MaigBindResult.Failure(MaigBindError.InvalidInput("accountId must not be blank"))
             }
-            val hash = saltedAccountHash(accountId)
-            val active = aliasSlotStore.getActiveAlias(hash)
-            val pending = aliasSlotStore.getPendingAlias(hash)
-            aliasSlotStore.setPendingAlias(hash, null)
-            if (pending != null && pending != active) {
-                runCatching { keyStoreGateway.deleteKey(pending) }
+            try {
+                val hash = keyStoreGateway.computeAccountHash(accountId)
+                val active = aliasSlotStore.getActiveAlias(hash)
+                val pending = aliasSlotStore.getPendingAlias(hash)
+                if (!aliasSlotStore.setPendingAlias(hash, null)) {
+                    return@withContext MaigBindResult.Failure(
+                        MaigBindError.PlatformFailure("Failed to clear pending key slot"),
+                    )
+                }
+                if (pending != null && pending != active) {
+                    runCatching { keyStoreGateway.deleteKey(pending) }
+                }
+                MaigBindResult.Success(Unit)
+            } catch (ex: Exception) {
+                MaigBindResult.Failure(mapPlatformException(ex))
             }
-            MaigBindResult.Success(Unit)
         }
 
     /**
-     * Recovers from client-server key state desynchronization (e.g., when the server activated a
-     * new binding and revoked the old one, but the app crashed before calling
-     * [activatePendingEnrollment]).
+     * Reconciles local active and pending key slots against the authoritative [serverActiveKeyIds]
+     * returned by a **successful** backend query.
+     *
+     * Important:
+     * - Never call this method when the backend query fails or times out; network errors must leave
+     *   local keys untouched.
+     * - Pass `emptySet()` only when the backend explicitly confirms zero active bindings. In that
+     *   case, any stale `active` key is cleared, while any staged `pending` key is **preserved** so
+     *   an in-flight `PENDING_POP` enrollment is never disrupted.
      */
     public suspend fun reconcileActiveKey(
         accountId: String,
-        serverActiveKeyId: String?,
+        serverActiveKeyIds: Set<String>,
     ): MaigBindResult<ReconciliationOutcome> =
         withContext(Dispatchers.IO) {
-            if (accountId.isBlank()) {
-                return@withContext MaigBindResult.Failure(MaigBindError.InvalidInput("accountId must not be blank"))
+            if (accountId.isBlank() || serverActiveKeyIds.any { it.isBlank() }) {
+                return@withContext MaigBindResult.Failure(
+                    MaigBindError.InvalidInput("accountId and serverActiveKeyIds entries must not be blank"),
+                )
             }
-            val hash = saltedAccountHash(accountId)
-            val activeKeyId = getEnrolledKeyId(accountId)
-            val pendingKeyId = getPendingKeyId(accountId)
+            try {
+                val hash = keyStoreGateway.computeAccountHash(accountId)
+                val activeAlias = aliasSlotStore.getActiveAlias(hash)
+                val activeKeyId = activeAlias?.let { keyStoreGateway.getPublicKeySpkiOrNull(it)?.let(::computeKeyId) }
+                val pendingAlias = aliasSlotStore.getPendingAlias(hash)
+                val pendingKeyId =
+                    pendingAlias?.let { keyStoreGateway.getPublicKeySpkiOrNull(it)?.let(::computeKeyId) }
 
-            if (serverActiveKeyId.isNullOrBlank()) {
-                aliasSlotStore.getActiveAlias(hash)?.let { runCatching { keyStoreGateway.deleteKey(it) } }
-                aliasSlotStore.getPendingAlias(hash)?.let { runCatching { keyStoreGateway.deleteKey(it) } }
-                aliasSlotStore.setActiveAlias(hash, null)
-                aliasSlotStore.setPendingAlias(hash, null)
-                return@withContext MaigBindResult.Success(ReconciliationOutcome.NOT_ENROLLED)
-            }
-
-            if (activeKeyId == serverActiveKeyId) {
-                return@withContext MaigBindResult.Success(ReconciliationOutcome.UP_TO_DATE)
-            }
-
-            if (pendingKeyId == serverActiveKeyId) {
-                val (promoted, previousActive) = aliasSlotStore.promotePendingToActive(hash)
-                if (promoted != null && previousActive != null && previousActive != promoted) {
-                    runCatching { keyStoreGateway.deleteKey(previousActive) }
+                if (activeKeyId != null && activeKeyId in serverActiveKeyIds) {
+                    return@withContext MaigBindResult.Success(ReconciliationOutcome.UP_TO_DATE)
                 }
-                return@withContext MaigBindResult.Success(ReconciliationOutcome.PROMOTED_PENDING)
-            }
 
-            MaigBindResult.Success(ReconciliationOutcome.NEEDS_RE_ENROLLMENT)
+                if (pendingKeyId != null && pendingKeyId in serverActiveKeyIds) {
+                    return@withContext when (val res = finalizePromotion(aliasSlotStore.promotePendingToActive(hash))) {
+                        is MaigBindResult.Failure -> res
+                        is MaigBindResult.Success ->
+                            MaigBindResult.Success(
+                                if (res.value) {
+                                    ReconciliationOutcome.PROMOTED_PENDING
+                                } else {
+                                    ReconciliationOutcome.NEEDS_RE_ENROLLMENT
+                                },
+                            )
+                    }
+                }
+
+                if (serverActiveKeyIds.isEmpty()) {
+                    if (activeAlias != null) {
+                        if (!aliasSlotStore.setActiveAlias(hash, null)) {
+                            return@withContext MaigBindResult.Failure(
+                                MaigBindError.PlatformFailure("Failed to clear stale active key slot"),
+                            )
+                        }
+                        // Never touch pending so mid-enrollment flow survives startup reconciliation.
+                        if (activeAlias != pendingAlias) {
+                            runCatching { keyStoreGateway.deleteKey(activeAlias) }
+                        }
+                    }
+                    return@withContext MaigBindResult.Success(ReconciliationOutcome.NOT_ENROLLED)
+                }
+
+                MaigBindResult.Success(ReconciliationOutcome.NEEDS_RE_ENROLLMENT)
+            } catch (ex: Exception) {
+                MaigBindResult.Failure(mapPlatformException(ex))
+            }
         }
 
     /**
@@ -290,12 +345,23 @@ public class MaigBind internal constructor(
         if (accountId.isBlank()) {
             return MaigBindResult.Failure(MaigBindError.InvalidInput("accountId must not be blank"))
         }
-        val activeAlias =
-            resolveActiveAlias(accountId)
-                ?: return MaigBindResult.Failure(MaigBindError.NotEnrolled(accountId))
-        val enrolledKeyId =
-            withContext(Dispatchers.IO) { keyStoreGateway.getPublicKeySpkiOrNull(activeAlias)?.let(::computeKeyId) }
-                ?: return MaigBindResult.Failure(MaigBindError.NotEnrolled(accountId))
+        val activeInfo =
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val alias =
+                        resolveActiveAlias(accountId)
+                            ?: return@runCatching MaigBindResult.Failure(MaigBindError.NotEnrolled(accountId))
+                    val enrolledKeyId =
+                        keyStoreGateway.getPublicKeySpkiOrNull(alias)?.let(::computeKeyId)
+                            ?: return@runCatching MaigBindResult.Failure(MaigBindError.NotEnrolled(accountId))
+                    MaigBindResult.Success(alias to enrolledKeyId)
+                }.getOrElse { ex -> MaigBindResult.Failure(mapPlatformException(ex)) }
+            }
+        val (activeAlias, enrolledKeyId) =
+            when (activeInfo) {
+                is MaigBindResult.Failure -> return activeInfo
+                is MaigBindResult.Success -> activeInfo.value
+            }
         if (payload.keyId != enrolledKeyId) {
             return MaigBindResult.Failure(
                 MaigBindError.InvalidInput("TransactionPayload.keyId does not match enrolled key for '$accountId'"),
@@ -325,11 +391,18 @@ public class MaigBind internal constructor(
                 return@withContext MaigBindResult.Failure(MaigBindError.InvalidInput("accountId must not be blank"))
             }
             return@withContext try {
-                val hash = saltedAccountHash(accountId)
-                aliasSlotStore.getActiveAlias(hash)?.let { keyStoreGateway.deleteKey(it) }
-                aliasSlotStore.getPendingAlias(hash)?.let { keyStoreGateway.deleteKey(it) }
-                aliasSlotStore.setActiveAlias(hash, null)
-                aliasSlotStore.setPendingAlias(hash, null)
+                val hash = keyStoreGateway.computeAccountHash(accountId)
+                val active = aliasSlotStore.getActiveAlias(hash)
+                val pending = aliasSlotStore.getPendingAlias(hash)
+                if (!aliasSlotStore.setActiveAlias(hash, null) || !aliasSlotStore.setPendingAlias(hash, null)) {
+                    return@withContext MaigBindResult.Failure(
+                        MaigBindError.PlatformFailure("Failed to clear key slot entries"),
+                    )
+                }
+                active?.let { keyStoreGateway.deleteKey(it) }
+                if (pending != null && pending != active) {
+                    keyStoreGateway.deleteKey(pending)
+                }
                 MaigBindResult.Success(Unit)
             } catch (ex: Exception) {
                 MaigBindResult.Failure(mapPlatformException(ex))
@@ -406,7 +479,7 @@ public class MaigBind internal constructor(
                     MaigBindResult.Success(Base64Url.encode(derSignature))
                 } catch (ex: Exception) {
                     if (ex is KeyPermanentlyInvalidatedException) {
-                        clearInvalidatedAlias(accountId, alias)
+                        withContext(Dispatchers.IO) { clearInvalidatedAlias(accountId, alias) }
                     }
                     MaigBindResult.Failure(mapPlatformException(ex))
                 }
@@ -414,19 +487,28 @@ public class MaigBind internal constructor(
         }
     }
 
-    private fun resolveActiveAlias(accountId: String): String? =
-        aliasSlotStore.getActiveAlias(saltedAccountHash(accountId))
+    private fun finalizePromotion(promotion: SlotPromotionResult): MaigBindResult<Boolean> =
+        when (promotion) {
+            is SlotPromotionResult.Promoted -> {
+                val prev = promotion.previousActiveAlias
+                if (prev != null && prev != promotion.newActiveAlias) {
+                    runCatching { keyStoreGateway.deleteKey(prev) }
+                }
+                MaigBindResult.Success(true)
+            }
+            SlotPromotionResult.NothingPending -> MaigBindResult.Success(false)
+            SlotPromotionResult.CommitFailed ->
+                MaigBindResult.Failure(MaigBindError.PlatformFailure("Failed to persist key slot promotion"))
+        }
 
-    private fun saltedAccountHash(accountId: String): String {
-        val salt = aliasSlotStore.getOrCreateInstallSalt()
-        return accountHash(accountId, salt)
-    }
+    private fun resolveActiveAlias(accountId: String): String? =
+        aliasSlotStore.getActiveAlias(keyStoreGateway.computeAccountHash(accountId))
 
     private fun clearInvalidatedAlias(
         accountId: String,
         alias: String,
     ) {
-        val hash = saltedAccountHash(accountId)
+        val hash = keyStoreGateway.computeAccountHash(accountId)
         runCatching { keyStoreGateway.deleteKey(alias) }
         if (aliasSlotStore.getActiveAlias(hash) == alias) aliasSlotStore.setActiveAlias(hash, null)
         if (aliasSlotStore.getPendingAlias(hash) == alias) aliasSlotStore.setPendingAlias(hash, null)
@@ -484,17 +566,6 @@ public class MaigBind internal constructor(
         }
 
     internal companion object {
-        fun accountHash(
-            accountId: String,
-            installSalt: ByteArray,
-        ): String {
-            val idBytes = accountId.encodeToByteArray()
-            val input = ByteArray(installSalt.size + idBytes.size)
-            installSalt.copyInto(input, destinationOffset = 0)
-            idBytes.copyInto(input, destinationOffset = installSalt.size)
-            return Sha256.digest(input).toHexString().take(24)
-        }
-
         fun freshAliasFor(accountHash: String): String = "maigbind:$accountHash:${UUID.randomUUID().toString().take(8)}"
     }
 }

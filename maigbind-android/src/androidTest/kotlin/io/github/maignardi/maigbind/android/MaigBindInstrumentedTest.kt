@@ -61,11 +61,10 @@ class MaigBindInstrumentedTest {
 
             // Verify KeyInfo enforces biometric authentication, per-use validity, and invalidation on new enrollment
             val slotStore = SharedPrefsKeyAliasSlotStore(context)
+            val gateway = PlatformAndroidKeyStoreGateway()
             val alias =
-                slotStore.getActiveAlias(
-                    MaigBind.accountHash("instrumented-test", slotStore.getOrCreateInstallSalt()),
-                )!!
-            val privateKey = PlatformAndroidKeyStoreGateway().getPrivateKeyOrNull(alias)!!
+                slotStore.getActiveAlias(gateway.computeAccountHash("instrumented-test"))!!
+            val privateKey = gateway.getPrivateKeyOrNull(alias)!!
             val keyInfo =
                 KeyFactory
                     .getInstance(privateKey.algorithm, "AndroidKeyStore")

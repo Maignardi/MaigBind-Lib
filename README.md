@@ -202,15 +202,19 @@ if (confirmResp.status == EnrollmentStatus.ACTIVE) {
     maigBind.abortPendingEnrollment(accountId)
 }
 
-// Crash recovery on app launch: query server's active keyId (e.g. GET /bindings/active)
-when (val sync = maigBind.reconcileActiveKey(accountId, serverActiveKeyId)) {
-    is MaigBindResult.Success -> when (sync.value) {
-        ReconciliationOutcome.PROMOTED_PENDING -> { /* crash happened right after server ACTIVE; recovered */ }
-        ReconciliationOutcome.NEEDS_RE_ENROLLMENT -> startStepUpEnrollment()
-        ReconciliationOutcome.UP_TO_DATE,
-        ReconciliationOutcome.NOT_ENROLLED -> { /* expected steady state */ }
+// Crash recovery on app launch: query server's active keyIds (e.g. GET /bindings/active).
+// IMPORTANT: only call reconcileActiveKey when the server query succeeded (never on network errors).
+val activeResp = api.getActiveBindings(accountId).getOrNull()
+if (activeResp != null) {
+    when (val sync = maigBind.reconcileActiveKey(accountId, activeResp.activeKeyIds.toSet())) {
+        is MaigBindResult.Success -> when (sync.value) {
+            ReconciliationOutcome.PROMOTED_PENDING -> { /* crash happened right after server ACTIVE; recovered */ }
+            ReconciliationOutcome.NEEDS_RE_ENROLLMENT -> startStepUpEnrollment()
+            ReconciliationOutcome.UP_TO_DATE,
+            ReconciliationOutcome.NOT_ENROLLED -> { /* expected steady state; staged pending keys are preserved */ }
+        }
+        is MaigBindResult.Failure -> handleMaigBindError(sync.error)
     }
-    is MaigBindResult.Failure -> handleMaigBindError(sync.error)
 }
 
 // Signing a sensitive operation
@@ -270,7 +274,7 @@ fun handleMaigBindError(error: MaigBindError) {
 
 #### Exclude `maigbind_slots.xml` from Android Auto Backup
 
-MaigBind stores per-install alias salts and active/pending alias pointers in `SharedPreferences` (`maigbind_slots.xml`), while the hardware keys themselves remain non-exportable inside that device's Android Keystore. If Auto Backup restores `maigbind_slots.xml` onto a new phone or clean reinstall, those alias pointers will reference non-existent hardware keys (falling back to `NotEnrolled`). Exclude it in your manifest's backup rules:
+MaigBind derives alias identifiers via a non-exportable `AndroidKeyStore` HMAC-SHA256 key (`maigbind:alias_hmac_v1`, never leaving hardware/Keystore) and stores active/pending alias pointers in `SharedPreferences` (`maigbind_slots.xml`). If Auto Backup restores `maigbind_slots.xml` onto a new phone or clean reinstall, those alias pointers will reference non-existent hardware keys (falling back to `NotEnrolled`). Exclude it in your manifest's backup rules:
 
 ```xml
 <!-- res/xml/data_extraction_rules.xml (Android 12+) -->

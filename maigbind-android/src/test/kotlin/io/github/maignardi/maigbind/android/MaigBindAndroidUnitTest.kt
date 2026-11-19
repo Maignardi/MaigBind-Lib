@@ -31,12 +31,24 @@ import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.Signature
 import java.security.spec.ECGenParameterSpec
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 @RunWith(RobolectricTestRunner::class)
 class MaigBindAndroidUnitTest {
     private class FakeKeyStoreGateway : AndroidKeyStoreGateway {
+        private val hmacKey = SecretKeySpec(ByteArray(32).also { SecureRandom().nextBytes(it) }, "HmacSHA256")
         val keys = mutableMapOf<String, Pair<KeyPair, SecurityBacking>>()
         var failStrongBoxWithUnavailable = false
+        var simulateCorruptedHmacKey = false
+
+        override fun computeAccountHash(accountId: String): String {
+            if (simulateCorruptedHmacKey) {
+                throw IllegalStateException("Keystore alias HMAC key is corrupted")
+            }
+            val mac = Mac.getInstance("HmacSHA256").apply { init(hmacKey) }
+            return mac.doFinal(accountId.encodeToByteArray()).toHexString().take(24)
+        }
 
         override fun generateHardwareKey(
             alias: String,
@@ -79,21 +91,23 @@ class MaigBindAndroidUnitTest {
         }
     }
 
-    private class InMemorySlotStore(
-        private val salt: ByteArray = ByteArray(32).also { SecureRandom().nextBytes(it) },
-    ) : KeyAliasSlotStore {
+    private class InMemorySlotStore : KeyAliasSlotStore {
         private val active = mutableMapOf<String, String>()
         private val pending = mutableMapOf<String, String>()
-
-        override fun getOrCreateInstallSalt(): ByteArray = salt
+        var failNextCommit = false
 
         override fun getActiveAlias(accountHash: String): String? = active[accountHash]
 
         override fun setActiveAlias(
             accountHash: String,
             alias: String?,
-        ) {
+        ): Boolean {
+            if (failNextCommit) {
+                failNextCommit = false
+                return false
+            }
             if (alias == null) active.remove(accountHash) else active[accountHash] = alias
+            return true
         }
 
         override fun getPendingAlias(accountHash: String): String? = pending[accountHash]
@@ -101,15 +115,25 @@ class MaigBindAndroidUnitTest {
         override fun setPendingAlias(
             accountHash: String,
             alias: String?,
-        ) {
+        ): Boolean {
+            if (failNextCommit) {
+                failNextCommit = false
+                return false
+            }
             if (alias == null) pending.remove(accountHash) else pending[accountHash] = alias
+            return true
         }
 
-        override fun promotePendingToActive(accountHash: String): Pair<String?, String?> {
-            val p = pending.remove(accountHash) ?: return null to null
+        override fun promotePendingToActive(accountHash: String): SlotPromotionResult {
+            val p = pending[accountHash] ?: return SlotPromotionResult.NothingPending
+            if (failNextCommit) {
+                failNextCommit = false
+                return SlotPromotionResult.CommitFailed
+            }
+            pending.remove(accountHash)
             val prev = active[accountHash]
             active[accountHash] = p
-            return p to prev
+            return SlotPromotionResult.Promoted(newActiveAlias = p, previousActiveAlias = prev)
         }
     }
 
@@ -160,29 +184,31 @@ class MaigBindAndroidUnitTest {
     }
 
     @Test
-    fun keystoreAliasUsesPerInstallSaltedHashToProtectLowEntropyCpfIds() =
+    fun keystoreAliasUsesKeystoreHmacForCpfPrivacyAndFailsClosedWhenCorrupted() =
         runTest {
             val cpf = "12345678900"
             val ks1 = FakeKeyStoreGateway()
-            val slots1 = InMemorySlotStore()
-            val sdk1 = MaigBind(MaigBindConfig(), ks1, FakeBiometricLauncher(), slots1)
+            val sdk1 = MaigBind(MaigBindConfig(), ks1, FakeBiometricLauncher(), InMemorySlotStore())
             sdk1.enroll(cpf, Base64Url.encode(ByteArray(32) { 1 }))
             val alias1 = ks1.keys.keys.single()
 
             val ks2 = FakeKeyStoreGateway()
-            val slots2 = InMemorySlotStore()
-            val sdk2 = MaigBind(MaigBindConfig(), ks2, FakeBiometricLauncher(), slots2)
+            val sdk2 = MaigBind(MaigBindConfig(), ks2, FakeBiometricLauncher(), InMemorySlotStore())
             sdk2.enroll(cpf, Base64Url.encode(ByteArray(32) { 1 }))
             val alias2 = ks2.keys.keys.single()
 
             val unsaltedHash = Sha256.digest(cpf.encodeToByteArray()).toHexString().take(24)
             assertFalse(alias1.contains(cpf))
             assertFalse(alias1.contains(unsaltedHash))
-            assertNotEquals(alias1, alias2) // different random install salts produce distinct aliases
+            assertNotEquals(alias1, alias2) // distinct non-exportable HMAC keys yield distinct aliases
+
+            ks1.simulateCorruptedHmacKey = true
+            val corruptedRes = sdk1.enroll(cpf, Base64Url.encode(ByteArray(32) { 2 }))
+            assertTrue((corruptedRes as MaigBindResult.Failure).error is MaigBindError.PlatformFailure)
         }
 
     @Test
-    fun initialAndReEnrollmentStayPendingUntilActivatedAndAbortNeverDeletesActiveKey() =
+    fun stagingActivationCommitFailureAndAbortGuardProtectActiveKey() =
         runTest {
             val ks = FakeKeyStoreGateway()
             val slots = InMemorySlotStore()
@@ -206,8 +232,16 @@ class MaigBindAndroidUnitTest {
             assertEquals(second.keyId, sdk.getPendingKeyId("user-1"))
             assertEquals(2, ks.keys.size)
 
+            // If SharedPreferences.commit() fails during activation, old active key MUST NOT be deleted
+            slots.failNextCommit = true
+            val failedPromote = sdk.activatePendingEnrollment("user-1")
+            assertTrue((failedPromote as MaigBindResult.Failure).error is MaigBindError.PlatformFailure)
+            assertEquals(first.keyId, sdk.getEnrolledKeyId("user-1"))
+            assertEquals(second.keyId, sdk.getPendingKeyId("user-1"))
+            assertEquals(2, ks.keys.size)
+
             // Guard: even if slots had pending == active (simulated corruption), abort MUST NOT delete active
-            val hash = MaigBind.accountHash("user-1", slots.getOrCreateInstallSalt())
+            val hash = ks.computeAccountHash("user-1")
             val activeAlias = slots.getActiveAlias(hash)!!
             slots.setPendingAlias(hash, activeAlias)
             sdk.abortPendingEnrollment("user-1")
@@ -231,43 +265,49 @@ class MaigBindAndroidUnitTest {
         }
 
     @Test
-    fun reconcileActiveKeyRecoversAfterCrashBetweenServerActivationAndClientPromotion() =
+    fun reconcileActiveKeySupportsMultiDeviceSetsAndPreservesPendingWhenEmpty() =
         runTest {
             val ks = FakeKeyStoreGateway()
             val slots = InMemorySlotStore()
             val sdk = MaigBind(MaigBindConfig(), ks, FakeBiometricLauncher(), slots)
 
-            val k1 = enrollAndActivate(sdk, "user-1", 1)
+            // First-time user mid-enrollment (PENDING_POP on server -> server reports empty active set):
+            val firstPending =
+                (sdk.enroll("new-user", Base64Url.encode(ByteArray(32) { 7 })) as MaigBindResult.Success).value.keyId
+            assertEquals(
+                ReconciliationOutcome.NOT_ENROLLED,
+                (sdk.reconcileActiveKey("new-user", emptySet()) as MaigBindResult.Success).value,
+            )
+            assertEquals(firstPending, sdk.getPendingKeyId("new-user")) // mid-enrollment pending preserved!
+
+            // Crash between server activation and client promote (multi-device set contains k2):
+            enrollAndActivate(sdk, "user-1", 1)
             val k2 = (sdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 2 })) as MaigBindResult.Success).value.keyId
-
-            // Server activated k2, but client crashed before activatePendingEnrollment()
-            assertEquals(k1, sdk.getEnrolledKeyId("user-1"))
-            assertEquals(k2, sdk.getPendingKeyId("user-1"))
-
-            val rec = (sdk.reconcileActiveKey("user-1", k2) as MaigBindResult.Success).value
+            val rec = (sdk.reconcileActiveKey("user-1", setOf("other-device-key", k2)) as MaigBindResult.Success).value
             assertEquals(ReconciliationOutcome.PROMOTED_PENDING, rec)
             assertEquals(k2, sdk.getEnrolledKeyId("user-1"))
             assertNull(sdk.getPendingKeyId("user-1"))
-            assertEquals(1, ks.keys.size)
 
             // Subsequent reconcile is UP_TO_DATE
             assertEquals(
                 ReconciliationOutcome.UP_TO_DATE,
-                (sdk.reconcileActiveKey("user-1", k2) as MaigBindResult.Success).value,
+                (sdk.reconcileActiveKey("user-1", setOf("other-device-key", k2)) as MaigBindResult.Success).value,
             )
 
-            // Unknown server keyId requires re-enrollment
+            // Unknown server keyIds require re-enrollment
             assertEquals(
                 ReconciliationOutcome.NEEDS_RE_ENROLLMENT,
-                (sdk.reconcileActiveKey("user-1", "different-device-key") as MaigBindResult.Success).value,
+                (sdk.reconcileActiveKey("user-1", setOf("different-device-key")) as MaigBindResult.Success).value,
             )
 
-            // Server null clears stale local slots
+            // Empty active set clears stale active key while preserving any new in-flight pending key
+            val k3 = (sdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 3 })) as MaigBindResult.Success).value.keyId
             assertEquals(
                 ReconciliationOutcome.NOT_ENROLLED,
-                (sdk.reconcileActiveKey("user-1", null) as MaigBindResult.Success).value,
+                (sdk.reconcileActiveKey("user-1", emptySet()) as MaigBindResult.Success).value,
             )
             assertFalse(sdk.hasEnrolledKey("user-1"))
+            assertEquals(k3, sdk.getPendingKeyId("user-1"))
         }
 
     @Test
