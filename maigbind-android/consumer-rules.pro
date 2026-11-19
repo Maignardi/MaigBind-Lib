@@ -1,0 +1,2 @@
+-keep class io.github.maignardi.maigbind.core.** { *; }
+-keep class io.github.maignardi.maigbind.android.** { *; }
