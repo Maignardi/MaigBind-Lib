@@ -45,7 +45,7 @@ class MaigBindAndroidUnitTest {
 
         override fun computeAccountHash(accountId: String): String {
             if (simulateCorruptedHmacKey) {
-                throw IllegalStateException("Keystore alias HMAC key is corrupted")
+                throw CorruptedAliasHmacKeyException("Keystore alias HMAC key is corrupted")
             }
             val mac = Mac.getInstance("HmacSHA256").apply { init(hmacKey) }
             return mac.doFinal(accountId.encodeToByteArray()).toHexString().take(24)
@@ -225,7 +225,7 @@ class MaigBindAndroidUnitTest {
 
             ks1.simulateCorruptedHmacKey = true
             val corruptedRes = sdk1.enroll(cpf, Base64Url.encode(ByteArray(32) { 2 }))
-            assertTrue((corruptedRes as MaigBindResult.Failure).error is MaigBindError.PlatformFailure)
+            assertTrue((corruptedRes as MaigBindResult.Failure).error is MaigBindError.LocalStateCorrupted)
 
             // Escape hatch: resetAll() wipes keys/slots & regenerates HMAC key so enrollment recovers
             assertTrue(sdk1.resetAll() is MaigBindResult.Success)

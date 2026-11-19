@@ -67,6 +67,15 @@ public sealed class MaigBindError {
         override val message: String,
     ) : MaigBindError()
 
+    /**
+     * Local alias derivation key or slot state is corrupted (e.g., the `AndroidKeyStore` HMAC
+     * key became unreadable). Call `resetAll()` to wipe local state and re-enroll via step-up.
+     */
+    public data class LocalStateCorrupted(
+        override val message: String =
+            "Local MaigBind key state is corrupted; call resetAll() and re-enroll",
+    ) : MaigBindError()
+
     /** Unexpected platform Keystore/Cryptographic failure. */
     public data class PlatformFailure(
         override val message: String,

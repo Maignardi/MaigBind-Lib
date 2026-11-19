@@ -261,7 +261,7 @@ We evaluated `github.com/android/keyattestation` (Google's official Kotlin repla
   - Pre-initialize `Signature.getInstance("SHA256withECDSA").initSign(privateKey)`.
   - Call `BiometricPrompt.authenticate(promptInfo, CryptoObject(signature))` displaying transaction summary in `PromptInfo`.
   - Inside `onAuthenticationSucceeded`: enforce `result.cryptoObject?.signature === signature` before `update(signingInput)` and `sign()`.
-  - All Keystore / Biometric errors map to sealed `MaigBindError` (`NeedsReEnrollment`, `NotEnrolled`, `BiometryUnavailable`, `BiometryNotEnrolled`, `Lockout`, `Cancelled`, `UserNotAuthenticated`, `CryptoObjectTampered`, `HardwareUnavailable`).
+  - All Keystore / Biometric errors map to sealed `MaigBindError` (`NeedsReEnrollment`, `NotEnrolled`, `BiometryUnavailable`, `BiometryNotEnrolled`, `Lockout`, `Cancelled`, `UserNotAuthenticated`, `CryptoObjectTampered`, `HardwareUnavailable`, `LocalStateCorrupted`, `InvalidInput`, `PlatformFailure`).
 
 ---
 

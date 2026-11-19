@@ -581,6 +581,8 @@ public class MaigBind internal constructor(
 
     private fun mapPlatformException(ex: Throwable): MaigBindError =
         when (ex) {
+            is CorruptedAliasHmacKeyException ->
+                MaigBindError.LocalStateCorrupted(ex.message ?: "Local MaigBind key state is corrupted")
             is KeyPermanentlyInvalidatedException -> MaigBindError.NeedsReEnrollment()
             is UserNotAuthenticatedException -> MaigBindError.UserNotAuthenticated()
             is StrongBoxUnavailableException ->

@@ -69,14 +69,14 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
                     val existing =
                         runCatching { ks.getKey(HMAC_KEY_ALIAS, null) as? SecretKey }
                             .getOrElse { ex ->
-                                throw IllegalStateException(
+                                throw CorruptedAliasHmacKeyException(
                                     "Keystore alias HMAC key '$HMAC_KEY_ALIAS' is corrupted; " +
                                         "call MaigBind.resetAll() to wipe local state and re-enroll",
                                     ex,
                                 )
                             }
                     existing
-                        ?: throw IllegalStateException(
+                        ?: throw CorruptedAliasHmacKeyException(
                             "Keystore alias HMAC key '$HMAC_KEY_ALIAS' returned null; " +
                                 "call MaigBind.resetAll() to wipe local state and re-enroll",
                         )

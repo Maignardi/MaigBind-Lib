@@ -60,6 +60,12 @@ internal sealed class SlotPromotionResult {
     data object CommitFailed : SlotPromotionResult()
 }
 
+/** Thrown when the non-exportable `AndroidKeyStore` alias HMAC key is corrupted or unreadable. */
+internal class CorruptedAliasHmacKeyException(
+    message: String,
+    cause: Throwable? = null,
+) : IllegalStateException(message, cause)
+
 /** Key generation artifact returned by [AndroidKeyStoreGateway]. */
 internal data class GeneratedKeyMaterial(
     val publicKeySpkiDer: ByteArray,

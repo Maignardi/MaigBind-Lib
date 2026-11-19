@@ -267,17 +267,12 @@ suspend fun handleMaigBindError(error: MaigBindError) {
         is MaigBindError.UserNotAuthenticated -> showRetryPrompt()
         is MaigBindError.CryptoObjectTampered -> abortAndReportSecurityTelemetry()
         is MaigBindError.HardwareUnavailable -> showHardwareUnavailableMessage()
-        is MaigBindError.InvalidInput -> showGenericError(error.message)
-        is MaigBindError.PlatformFailure -> {
-            // e.g. IllegalStateException when AndroidKeyStore alias HMAC key is corrupted:
-            // wipe local keys/slots and send user back through step-up enrollment.
-            if (error.causeName == "IllegalStateException" && error.message.contains("resetAll")) {
-                maigBind.resetAll()
-                startStepUpEnrollment()
-            } else {
-                showGenericError(error.message)
-            }
+        is MaigBindError.LocalStateCorrupted -> {
+            maigBind.resetAll()
+            startStepUpEnrollment()
         }
+        is MaigBindError.InvalidInput,
+        is MaigBindError.PlatformFailure -> showGenericError(error.message)
     }
 }
 ```
