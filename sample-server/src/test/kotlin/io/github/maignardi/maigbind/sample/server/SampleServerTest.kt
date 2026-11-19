@@ -1,8 +1,6 @@
 package io.github.maignardi.maigbind.sample.server
 
-import io.github.maignardi.maigbind.core.AuthPolicyUsed
 import io.github.maignardi.maigbind.core.Base64Url
-import io.github.maignardi.maigbind.core.ClientAuthMetadata
 import io.github.maignardi.maigbind.core.EnrollmentAttestResponse
 import io.github.maignardi.maigbind.core.EnrollmentConfirmRequest
 import io.github.maignardi.maigbind.core.EnrollmentConfirmResponse
@@ -206,11 +204,6 @@ class SampleServerTest {
                             bindingId = attestBody.bindingId,
                             popPayload = popPayload,
                             signatureBase64Url = Base64Url.encode(popSig),
-                            authMetadata =
-                                ClientAuthMetadata(
-                                    SecurityBacking.STRONGBOX,
-                                    AuthPolicyUsed.BIOMETRIC_STRONG,
-                                ),
                         ),
                     ),
                 )
@@ -244,7 +237,6 @@ class SampleServerTest {
             SignedPayload(
                 payload = txPayload,
                 signatureBase64Url = Base64Url.encode(ecdsaSign(devKey, txPayload.signingInput())),
-                authMetadata = ClientAuthMetadata(SecurityBacking.STRONGBOX, AuthPolicyUsed.BIOMETRIC_STRONG),
             )
         return ExecuteTransferHttpRequest(
             accountId = "acct-99",

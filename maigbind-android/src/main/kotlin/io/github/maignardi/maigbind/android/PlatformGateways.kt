@@ -1,6 +1,7 @@
 package io.github.maignardi.maigbind.android
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
@@ -50,7 +51,7 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
 
         if (tryStrongBox) {
             try {
-                generateWithSpec(
+                generateWithDeviceIdFallback(
                     alias = alias,
                     attestationChallenge = attestationChallenge,
                     useStrongBox = true,
@@ -58,14 +59,9 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
                 )
                 usedStrongBox = true
             } catch (ex: StrongBoxUnavailableException) {
-                if (config.requireStrongBox) {
-                    throw ex
-                }
-                // StrongBox unavailable on this device: fall back cleanly to TEE.
+                if (config.requireStrongBox) throw ex
             } catch (ex: ProviderException) {
-                if (config.requireStrongBox || !isStrongBoxUnavailableCause(ex)) {
-                    throw ex
-                }
+                if (config.requireStrongBox || !isStrongBoxUnavailableCause(ex)) throw ex
             }
         }
 
@@ -73,27 +69,12 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
             if (config.requireStrongBox) {
                 throw StrongBoxUnavailableException("StrongBox requires Android 9 (API 28) or higher")
             }
-            try {
-                generateWithSpec(
-                    alias = alias,
-                    attestationChallenge = attestationChallenge,
-                    useStrongBox = false,
-                    includeDeviceIdAttestation = config.includeDevicePropertiesAttestation,
-                )
-            } catch (ex: ProviderException) {
-                // Some devices lack Device ID attestation provisioning even on API 31+;
-                // retry without device properties attestation unless caller explicitly handles failure.
-                if (config.includeDevicePropertiesAttestation) {
-                    generateWithSpec(
-                        alias = alias,
-                        attestationChallenge = attestationChallenge,
-                        useStrongBox = false,
-                        includeDeviceIdAttestation = false,
-                    )
-                } else {
-                    throw ex
-                }
-            }
+            generateWithDeviceIdFallback(
+                alias = alias,
+                attestationChallenge = attestationChallenge,
+                useStrongBox = false,
+                includeDeviceIdAttestation = config.includeDevicePropertiesAttestation,
+            )
         }
 
         val ks = loadKeyStore()
@@ -107,6 +88,34 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
             attestationChainDer = chain.map { it.encoded },
             securityBacking = backing,
         )
+    }
+
+    private fun generateWithDeviceIdFallback(
+        alias: String,
+        attestationChallenge: ByteArray,
+        useStrongBox: Boolean,
+        includeDeviceIdAttestation: Boolean,
+    ) {
+        try {
+            generateWithSpec(
+                alias = alias,
+                attestationChallenge = attestationChallenge,
+                useStrongBox = useStrongBox,
+                includeDeviceIdAttestation = includeDeviceIdAttestation,
+            )
+        } catch (ex: ProviderException) {
+            // Re-throw StrongBox unavailability so outer caller can fall back to TEE;
+            // otherwise retry without device properties attestation if that flag triggered the failure.
+            if (isStrongBoxUnavailableCause(ex) || !includeDeviceIdAttestation) {
+                throw ex
+            }
+            generateWithSpec(
+                alias = alias,
+                attestationChallenge = attestationChallenge,
+                useStrongBox = useStrongBox,
+                includeDeviceIdAttestation = false,
+            )
+        }
     }
 
     private fun generateWithSpec(
@@ -207,27 +216,55 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
     }
 }
 
+/** SharedPreferences-backed alias slot tracker keyed strictly by SHA-256 account hashes (no PII). */
+internal class SharedPrefsKeyAliasSlotStore(
+    context: Context,
+) : KeyAliasSlotStore {
+    private val prefs: SharedPreferences =
+        context.applicationContext.getSharedPreferences("maigbind_slots", Context.MODE_PRIVATE)
+
+    override fun getActiveAlias(accountHash: String): String? = prefs.getString("active:$accountHash", null)
+
+    override fun setActiveAlias(
+        accountHash: String,
+        alias: String?,
+    ) {
+        prefs
+            .edit()
+            .apply {
+                if (alias == null) remove("active:$accountHash") else putString("active:$accountHash", alias)
+            }.apply()
+    }
+
+    override fun getPendingAlias(accountHash: String): String? = prefs.getString("pending:$accountHash", null)
+
+    override fun setPendingAlias(
+        accountHash: String,
+        alias: String?,
+    ) {
+        prefs
+            .edit()
+            .apply {
+                if (alias == null) remove("pending:$accountHash") else putString("pending:$accountHash", alias)
+            }.apply()
+    }
+}
+
 /**
- * Production `androidx.biometric.BiometricPrompt` launcher restricted by default to `BIOMETRIC_STRONG`.
+ * Production `androidx.biometric.BiometricPrompt` launcher strictly restricted to `BIOMETRIC_STRONG`.
+ *
+ * Note: Android throws `IllegalArgumentException` if `CryptoObject` is combined with `BIOMETRIC_WEAK`
+ * or `DEVICE_CREDENTIAL`; only Class 3 strong biometrics are permitted.
  *
  * Reference: https://developer.android.com/training/sign-in/biometric-auth
  */
 internal class PlatformBiometricPromptLauncher(
     private val appContext: Context,
 ) : BiometricPromptLauncher {
-    override fun checkCapability(allowWeak: Boolean): BiometricCapability {
+    override fun checkCapability(): BiometricCapability {
         val manager = BiometricManager.from(appContext)
-        val strongStatus = manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-        if (strongStatus == BiometricManager.BIOMETRIC_SUCCESS) {
-            return BiometricCapability.READY_STRONG
-        }
-        if (allowWeak &&
-            manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) ==
-            BiometricManager.BIOMETRIC_SUCCESS
-        ) {
-            return BiometricCapability.READY_WEAK_ONLY
-        }
-        return when (strongStatus) {
+        return when (manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)) {
+            BiometricManager.BIOMETRIC_SUCCESS -> BiometricCapability.READY_STRONG
             BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> BiometricCapability.NONE_ENROLLED
             BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> BiometricCapability.HARDWARE_UNAVAILABLE
             BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE -> BiometricCapability.NO_HARDWARE
@@ -242,7 +279,6 @@ internal class PlatformBiometricPromptLauncher(
         subtitle: String?,
         description: String?,
         negativeButtonText: String,
-        authenticators: Int,
         signature: Signature,
     ): BiometricPromptOutcome =
         withContext(Dispatchers.Main.immediate) {
@@ -279,7 +315,7 @@ internal class PlatformBiometricPromptLauncher(
                             if (!subtitle.isNullOrBlank()) setSubtitle(subtitle)
                             if (!description.isNullOrBlank()) setDescription(description)
                         }.setNegativeButtonText(negativeButtonText)
-                        .setAllowedAuthenticators(authenticators)
+                        .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
                         .build()
 
                 cont.invokeOnCancellation {

@@ -1,8 +1,6 @@
 package io.github.maignardi.maigbind.verifier
 
-import io.github.maignardi.maigbind.core.AuthPolicyUsed
 import io.github.maignardi.maigbind.core.Base64Url
-import io.github.maignardi.maigbind.core.ClientAuthMetadata
 import io.github.maignardi.maigbind.core.DomainTag
 import io.github.maignardi.maigbind.core.EnrollmentConfirmRequest
 import io.github.maignardi.maigbind.core.EnrollmentPoPPayload
@@ -176,7 +174,6 @@ class MaigBindVerifierTest {
                     attestResp.bindingId,
                     popPayload,
                     Base64Url.encode(TestPkiFixture.ecdsaSign(devKey.private, popPayload.signingInput())),
-                    ClientAuthMetadata(SecurityBacking.STRONGBOX, AuthPolicyUsed.BIOMETRIC_STRONG),
                 ),
             )
         assertEquals(EnrollmentStatus.ACTIVE, confirmResp.status)
@@ -373,11 +370,7 @@ class MaigBindVerifierTest {
         val wrongDomainVerdict =
             verifier.verifyTransaction(
                 "acct-1",
-                SignedPayload(
-                    tx,
-                    Base64Url.encode(wrongDomainSig),
-                    ClientAuthMetadata(SecurityBacking.TEE, AuthPolicyUsed.BIOMETRIC_STRONG),
-                ),
+                SignedPayload(tx, Base64Url.encode(wrongDomainSig)),
                 "PIX_TRANSFER",
                 tx.fields,
             )
@@ -541,7 +534,6 @@ class MaigBindVerifierTest {
                     attest.bindingId,
                     popPayload,
                     Base64Url.encode(TestPkiFixture.ecdsaSign(keyPair.private, popPayload.signingInput())),
-                    ClientAuthMetadata(SecurityBacking.TEE, AuthPolicyUsed.BIOMETRIC_STRONG),
                 ),
             )
         assertEquals(EnrollmentStatus.ACTIVE, confirm.status)

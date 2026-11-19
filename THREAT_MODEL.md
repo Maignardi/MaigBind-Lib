@@ -41,10 +41,9 @@ No client-side mobile library is unbypassable. An attacker who controls the OS k
 - **Attack:** Public scripts (e.g., WithSecure/F-Secure *Universal Android Biometric Bypass*) hook `BiometricPrompt.AuthenticationCallback.onAuthenticationSucceeded` and pass a forged `AuthenticationResult` with a `null` `CryptoObject`, or a `CryptoObject` wrapping an attacker-controlled or unauthenticated `Signature` instance.
 - **MaigBind Mitigation:**
   1. `Signature.initSign(privateKey)` is called **before** `BiometricPrompt.authenticate(promptInfo, CryptoObject(signature))`.
-  2. Inside `onAuthenticationSucceeded(result)`, MaigBind validates that `result.cryptoObject` is non-null **and** that `result.cryptoObject?.signature === expectedSignature` (strict reference identity `===`). Any mismatch aborts with a fatal typed error (`CryptoObjectTampered`).
-  3. `signature.update(signingInput)` and `signature.sign()` execute inside the callback. Because the Keystore key was created with `setUserAuthenticationRequired(true)` and `timeout = 0` (`AUTH_BIOMETRIC_STRONG`), KeyMint/Keymaster refuses to compute the ECDSA signature unless the biometric HAL minted a valid hardware HMAC `AuthToken` for that exact operation handle.
-  4. Even if an attacker replaces the `Signature` object in memory or forces a software key, the resulting signature fails server-side ECDSA verification against the hardware-attested public key stored during enrollment.
-- **Status:** **Mitigated.**
+  2. Inside `onAuthenticationSucceeded(result)`, MaigBind validates that `result.cryptoObject` is non-null **and** that `result.cryptoObject?.signature === expectedSignature` (strict reference identity `===`) as **client-side defense-in-depth** to fail fast on simple callback hooks. (An attacker with Frida can also hook that reference comparison in bytecode/memory.)
+  3. **Authoritative Mitigation (Server-Side):** `signature.update(signingInput)` and `signature.sign()` execute inside the callback. Because the Keystore key was created with `setUserAuthenticationRequired(true)`, `AUTH_BIOMETRIC_STRONG`, and `timeout = 0`, KeyMint/Keymaster refuses to compute the ECDSA signature unless the biometric HAL minted a valid hardware HMAC `AuthToken` for that exact operation handle. Even if an attacker hooks the client check or swaps in a software key, the forged signature fails server-side ECDSA verification against the hardware-attested public key stored during enrollment.
+- **Status:** **Mitigated** (by hardware KeyMint AuthToken + server-side ECDSA verification).
 
 ---
 
@@ -62,16 +61,16 @@ No client-side mobile library is unbypassable. An attacker who controls the OS k
 - **MaigBind Mitigation:**
   1. **Real-time Revocation Checks:** `maigbind-verifier` fetches and caches `https://android.googleapis.com/attestation/status` (configurable TTL) and rejects any certificate chain whose serial appears with `REVOKED` or `SUSPENDED`. This immediately neutralizes known leaked keyboxes.
   2. **Strict `hardwareEnforced` Inspection:** All security-critical tags (`rootOfTrust.verifiedBootState == VERIFIED`, `rootOfTrust.deviceLocked == true`, `purpose`, `algorithm`, `ecCurve`, `userAuthType`, `authTimeout`, `osPatchLevel`) are read exclusively from `hardwareEnforced` (never `softwareEnforced`), and `attestationSecurityLevel` / `keymasterSecurityLevel` must be `TRUSTED_ENVIRONMENT` or `STRONG_BOX` (never `SOFTWARE`).
-  3. **RKP vs. Factory Key Policy:** After Android's April 10, 2026 RKP root migration (ECDSA P-384), `VerificationPolicy` allows servers to restrict or flag legacy factory-keyed chains (`allowFactoryKeys = false` for high-assurance tiers).
-  4. **Suspicious Keybox Heuristics:** `maigbind-verifier` tracks certificate issuer/intermediate fan-out hooks so the backend can detect and flag when the same factory keybox serial attests an anomalous number of distinct accounts/devices.
+  3. **RKP vs. Factory Key Policy:** After Android's April 10, 2026 RKP root cutover (ECDSA P-384, rolled out Feb 2026), `VerificationPolicy` allows servers to restrict or flag legacy factory-keyed chains (`allowFactoryKeys = false` for high-assurance tiers).
+  4. **Experimental Keybox Velocity Telemetry:** `maigbind-verifier` optionally tracks distinct accounts per leaf-adjacent batch certificate within a short sliding window (`keyboxSuspicionThreshold`, default 1,000 accounts / 10 min, `rejectOnSuspiciousKeybox = false`). Because Google legitimately shares factory batch certificates across ~100,000+ handsets, this heuristic is **experimental telemetry only** and should not be used alone for hard blocking.
 - **Residual Risk (Honest Assessment):** If an attacker possesses a *private, unrevoked* leaked factory keybox not yet listed in Google's status endpoint, cryptographic attestation verification alone cannot distinguish it from a genuine factory device.
 - **Status:** **Mitigated for revoked/software-spoofed keyboxes; Made Significantly Harder / Detectable for private unrevoked keyboxes.** Combine with Google **Play Integrity API** (server-side verdict) and backend risk signals.
 
 ---
 
-### T4. Attestation Relay (Quarkslab, August 2026)
+### T4. Attestation Relay (Quarkslab, August 11, 2026)
 
-- **Attack:** As demonstrated by Quarkslab (*"Bypassing Android Hardware Attestation from the Analyst's Chair"*, Aug 2026), Frida hooks the key-generation/attestation code in the target app on a rooted device, forwards the server's `attestationChallenge` over the network to a clean, locked "oracle" device running a custom attestation helper app, and relays the genuine certificate chain back to the server.
+- **Attack:** As demonstrated by Eric Le Guevel / Quarkslab (*"Bypassing Android Hardware Attestation from the Analyst's Chair"*, August 11, 2026, `android-hardware-attestation-demo`), Frida hooks the key-generation/attestation code in the target app on a rooted device, forwards the server's `attestationChallenge` over the network to a clean, locked "oracle" device running a custom attestation helper app, and relays the genuine certificate chain back to the server.
 - **Why Naive Implementations Fail:** Key attestation proves that *some* healthy secure hardware generated a key for that challenge — **not** that the key resides on *this* physical device, *this* process, or *this* active session.
 - **MaigBind Mitigation (Defense-in-Depth):**
   1. **App Identity Binding (`attestationApplicationId`, Tag 709):** `maigbind-verifier` verifies that the package name and SHA-256 signing certificate digest in Tag 709 match the genuine app. This blocks a generic third-party "oracle app" on the clean device; the attacker would have to run the genuine banking app itself on the clean device. (Tag 709 is in `softwareEnforced`, so MaigBind trusts it **only** when `hardwareEnforced` `rootOfTrust` proves `VERIFIED` + `deviceLocked == true`.)
@@ -120,11 +119,11 @@ No client-side mobile library is unbypassable. An attacker who controls the OS k
 
 - **Attack:** Attacker forces `BiometricPrompt` to fall back to weak biometrics (Class 2 face unlock), device PIN/pattern (`DEVICE_CREDENTIAL`), or forces key generation in software keystore rather than TEE/StrongBox.
 - **MaigBind Mitigation:**
-  1. **Client-Side Enforcement:** `KeyGenParameterSpec` configures `AUTH_BIOMETRIC_STRONG` with `timeout = 0` (API 30+) or `setUserAuthenticationValidityDurationSeconds(-1)` (API < 30). `BiometricPrompt` strictly requests `BIOMETRIC_STRONG` (never `DEVICE_CREDENTIAL` or `BIOMETRIC_WEAK` unless explicitly overridden by a non-default integrator flag, which is explicitly tagged in the signed metadata).
-  2. **Server-Side Enforcement:** `maigbind-verifier` inspects the attestation extension's `hardwareEnforced` list and rejects:
+  1. **Client-Side Enforcement:** `KeyGenParameterSpec` configures `AUTH_BIOMETRIC_STRONG` with `timeout = 0` (API 30+) or `setUserAuthenticationValidityDurationSeconds(-1)` (API < 30). `BiometricPrompt` strictly enforces `BIOMETRIC_STRONG` only — Android throws `IllegalArgumentException` if `CryptoObject` is paired with `BIOMETRIC_WEAK` or `DEVICE_CREDENTIAL`, so weak/credential fallbacks are not supported.
+  2. **Server-Side Enforcement (Authoritative):** `maigbind-verifier` never trusts unsigned client flags; it inspects the Google-signed attestation extension's `hardwareEnforced` list and rejects:
      - `attestationSecurityLevel` or `keymasterSecurityLevel == SOFTWARE`
      - Presence of `noAuthRequired`
-     - `userAuthType` lacking biometric hardware (`USER_AUTH_TYPE_BIOMETRIC`) or permitting password-only without policy opt-in
+     - `userAuthType` lacking biometric hardware (`HW_AUTH_BIOMETRIC`)
      - `authTimeout` present and `> 0`
      - Weak curves/algorithms (requires EC P-256, `PURPOSE_SIGN`).
 - **Status:** **Mitigated.**
@@ -151,7 +150,7 @@ No client-side mobile library is unbypassable. An attacker who controls the OS k
     1. Gate `POST /enroll/begin` behind **strong step-up authentication** (MFA, SMS/email OTP + out-of-band confirmation, eKYC/liveness check, or approval from an existing bound device).
     2. Enforce **cooling-off windows** or transaction limits on newly enrolled bindings.
     3. Send out-of-band push/email/SMS notifications whenever a new `keyId` is bound or old bindings are revoked.
-    4. Restrict the maximum number of active device bindings per account.
+    4. Enforce `maxActiveBindingsPerAccount` (default `1` active binding per account, automatically revoking prior devices on re-enrollment) and expose `revokeBinding()` / `revokeAccountBindings()` for lost/stolen devices.
 - **Status:** **Integrator / Backend Responsibility** (documented as a mandatory integration contract).
 
 ---

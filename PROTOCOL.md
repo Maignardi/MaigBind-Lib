@@ -112,7 +112,7 @@ TransactionPayload = {
 - **`SignedPayload`** (client -> server):
   - `payload: TransactionPayload`
   - `signatureBase64Url: String` (DER ECDSA `(r, s)`)
-  - `authMetadata: ClientAuthMetadata` (`securityBacking`: `STRONGBOX` | `TEE` | `SECURE_ENCLAVE`, `authPolicyUsed`: `BIOMETRIC_STRONG` | `BIOMETRIC_WEAK_OPT_IN`)
+  *(Note: `securityBacking` and biometric enforcement properties are retrieved on the server from the attested `DeviceBinding` persisted during enrollment, never trusted from unsigned client metadata.)*
 - **`VerificationVerdict`** (server result):
   - `status: VerdictStatus` (`VERIFIED`, `REJECTED_POLICY`, `REJECTED_FRAUD_SIGNAL`, `ERROR_VALIDATION_INFRA`)
   - `keyId: String?`
@@ -245,7 +245,7 @@ We evaluated `github.com/android/keyattestation` (Google's official Kotlin repla
 ## 8. Android Client Requirements (`maigbind-android`)
 
 - **minSdk:** `24` (Android 7.0 — first API level supporting hardware Key Attestation).
-- **Alias Isolation:** One key alias per account: `maigbind:<accountId>`.
+- **Alias Isolation & Non-PII:** Keystore aliases use `maigbind:<sha256(accountId) prefix>:<randomTag>` (never raw email/CPF/PII). On re-enrollment, the new key is staged under a pending alias so an interrupted enrollment never destroys an active working key until `activatePendingEnrollment(accountId)` is called.
 - **Key Generation (`KeyGenParameterSpec`):**
   - `KEY_ALGORITHM_EC`, `PURPOSE_SIGN`, `DIGEST_SHA256`, `ECGenParameterSpec("secp256r1")`.
   - `setUserAuthenticationRequired(true)`.

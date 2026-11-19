@@ -240,25 +240,16 @@ public data class EnrollmentPoPPayload(
 }
 
 /**
- * Metadata reported by the client describing how the signature was produced.
- *
- * The server cross-checks these claims against the hardware-attested key properties stored
- * during enrollment.
- */
-@Serializable
-public data class ClientAuthMetadata(
-    val securityBacking: SecurityBacking,
-    val authPolicyUsed: AuthPolicyUsed,
-)
-
-/**
  * Client-produced cryptographic proof of a sensitive operation.
+ *
+ * Security-critical hardware properties (`securityBacking`, biometric auth enforcement, boot state)
+ * are established exclusively from the server-stored attested [EnrollmentStatus.ACTIVE] binding —
+ * never from unsigned client-supplied metadata.
  */
 @Serializable
 public data class SignedPayload(
     val payload: TransactionPayload,
     val signatureBase64Url: String,
-    val authMetadata: ClientAuthMetadata,
 )
 
 /**
@@ -273,7 +264,6 @@ public data class EnrollmentRequest(
     val attestationChainBase64Url: List<String>,
     val challengeBase64Url: String,
     val securityBacking: SecurityBacking,
-    val authPolicyUsed: AuthPolicyUsed = AuthPolicyUsed.BIOMETRIC_STRONG,
 )
 
 /**
@@ -284,7 +274,6 @@ public data class EnrollmentConfirmRequest(
     val bindingId: String,
     val popPayload: EnrollmentPoPPayload,
     val signatureBase64Url: String,
-    val authMetadata: ClientAuthMetadata,
 )
 
 /**
@@ -390,7 +379,6 @@ public enum class FindingCode {
     PAYLOAD_EXPIRED_OR_FUTURE,
     SIGNATURE_INVALID,
     PAYLOAD_FIELD_MISMATCH,
-    DOWNGRADED_AUTH_POLICY_REJECTED,
     INFRA_TRUST_STORE_UNAVAILABLE,
     INFRA_REVOCATION_LIST_UNAVAILABLE,
     INFRA_FAIL_OPEN_APPLIED,

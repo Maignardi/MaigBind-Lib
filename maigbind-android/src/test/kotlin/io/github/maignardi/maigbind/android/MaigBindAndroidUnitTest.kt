@@ -2,10 +2,7 @@ package io.github.maignardi.maigbind.android
 
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.StrongBoxUnavailableException
-import androidx.biometric.BiometricManager
-import androidx.biometric.BiometricPrompt
 import androidx.fragment.app.FragmentActivity
-import io.github.maignardi.maigbind.core.AuthPolicyUsed
 import io.github.maignardi.maigbind.core.Base64Url
 import io.github.maignardi.maigbind.core.MaigBindError
 import io.github.maignardi.maigbind.core.MaigBindResult
@@ -18,6 +15,7 @@ import io.github.maignardi.maigbind.core.computeKeyId
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -33,7 +31,6 @@ import java.security.spec.ECGenParameterSpec
 class MaigBindAndroidUnitTest {
     private class FakeKeyStoreGateway : AndroidKeyStoreGateway {
         val keys = mutableMapOf<String, Pair<KeyPair, SecurityBacking>>()
-        var failNextInitWithInvalidated = false
         var failStrongBoxWithUnavailable = false
 
         override fun generateHardwareKey(
@@ -59,18 +56,12 @@ class MaigBindAndroidUnitTest {
             keys[alias] = kp to backing
             return GeneratedKeyMaterial(
                 publicKeySpkiDer = kp.public.encoded,
-                attestationChainDer = listOf(kp.public.encoded), // Mock chain for unit test
+                attestationChainDer = listOf(kp.public.encoded),
                 securityBacking = backing,
             )
         }
 
-        override fun getPrivateKeyOrNull(alias: String): PrivateKey? {
-            if (failNextInitWithInvalidated) {
-                failNextInitWithInvalidated = false
-                throw KeyPermanentlyInvalidatedException("Biometrics changed")
-            }
-            return keys[alias]?.first?.private
-        }
+        override fun getPrivateKeyOrNull(alias: String): PrivateKey? = keys[alias]?.first?.private
 
         override fun getPublicKeySpkiOrNull(alias: String): ByteArray? = keys[alias]?.first?.public?.encoded
 
@@ -84,13 +75,34 @@ class MaigBindAndroidUnitTest {
         }
     }
 
+    private class InMemorySlotStore : KeyAliasSlotStore {
+        private val active = mutableMapOf<String, String>()
+        private val pending = mutableMapOf<String, String>()
+
+        override fun getActiveAlias(accountHash: String): String? = active[accountHash]
+
+        override fun setActiveAlias(
+            accountHash: String,
+            alias: String?,
+        ) {
+            if (alias == null) active.remove(accountHash) else active[accountHash] = alias
+        }
+
+        override fun getPendingAlias(accountHash: String): String? = pending[accountHash]
+
+        override fun setPendingAlias(
+            accountHash: String,
+            alias: String?,
+        ) {
+            if (alias == null) pending.remove(accountHash) else pending[accountHash] = alias
+        }
+    }
+
     private class FakeBiometricLauncher(
         var capability: BiometricCapability = BiometricCapability.READY_STRONG,
         var outcomeProvider: (Signature) -> BiometricPromptOutcome = { BiometricPromptOutcome.Succeeded(it) },
     ) : BiometricPromptLauncher {
-        var lastAuthenticators: Int = -1
-
-        override fun checkCapability(allowWeak: Boolean): BiometricCapability = capability
+        override fun checkCapability(): BiometricCapability = capability
 
         override suspend fun authenticate(
             activity: FragmentActivity,
@@ -98,12 +110,8 @@ class MaigBindAndroidUnitTest {
             subtitle: String?,
             description: String?,
             negativeButtonText: String,
-            authenticators: Int,
             signature: Signature,
-        ): BiometricPromptOutcome {
-            lastAuthenticators = authenticators
-            return outcomeProvider(signature)
-        }
+        ): BiometricPromptOutcome = outcomeProvider(signature)
     }
 
     private fun createActivity(): FragmentActivity =
@@ -117,66 +125,111 @@ class MaigBindAndroidUnitTest {
         )
 
     @Test
-    fun rejectsFridaHookReturningNullCryptoObject() =
+    fun keystoreAliasHashesAccountIdAndNeverStoresPii() =
         runTest {
             val ks = FakeKeyStoreGateway()
-            val bio =
-                FakeBiometricLauncher {
-                    // Simulates Universal Android Biometric Bypass returning AuthenticationResult(null)
-                    BiometricPromptOutcome.Succeeded(returnedSignature = null)
-                }
-            val sdk = MaigBind(MaigBindConfig(), ks, bio)
-            val enrollRes = sdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 1 }))
+            val sdk = MaigBind(MaigBindConfig(), ks, FakeBiometricLauncher(), InMemorySlotStore())
+            val piiAccount = "maria.silva+12345678900@banco.com.br"
+            val enrollRes = sdk.enroll(piiAccount, Base64Url.encode(ByteArray(32) { 1 }))
             assertTrue(enrollRes is MaigBindResult.Success)
-            val keyId = (enrollRes as MaigBindResult.Success).value.keyId
-
-            val tx =
-                TransactionPayload(
-                    keyId = keyId,
-                    operationType = "PIX_TRANSFER",
-                    nonce = "nonce-1",
-                    issuedAt = 1000L,
-                    expiresAt = 2000L,
-                    fields = canonicalFields("amountCents" to canonical(150_000L)),
-                )
-            val signRes = sdk.sign(createActivity(), "user-1", tx, prompt)
-            assertTrue(signRes is MaigBindResult.Failure)
-            assertTrue((signRes as MaigBindResult.Failure).error is MaigBindError.CryptoObjectTampered)
+            val alias = ks.keys.keys.single()
+            assertFalse(alias.contains("maria"))
+            assertFalse(alias.contains("12345678900"))
+            assertTrue(alias.startsWith("maigbind:${MaigBind.accountHash(piiAccount)}:"))
         }
 
     @Test
-    fun rejectsFridaHookSwappingSignatureInstance() =
+    fun reEnrollmentStagesPendingKeyWithoutDestroyingActiveKeyUntilPromoted() =
         runTest {
             val ks = FakeKeyStoreGateway()
-            val rogueSignature = Signature.getInstance("SHA256withECDSA")
-            val bio =
-                FakeBiometricLauncher {
-                    // Simulates Frida replacing result.cryptoObject with a different Signature object
-                    BiometricPromptOutcome.Succeeded(returnedSignature = rogueSignature)
-                }
-            val sdk = MaigBind(MaigBindConfig(), ks, bio)
-            val enrollRes = sdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 1 })) as MaigBindResult.Success
+            val slots = InMemorySlotStore()
+            val bio = FakeBiometricLauncher()
+            val sdk = MaigBind(MaigBindConfig(), ks, bio, slots)
+            val activity = createActivity()
 
+            val first = (sdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 1 })) as MaigBindResult.Success).value
+            assertEquals(first.keyId, sdk.getEnrolledKeyId("user-1"))
+
+            // Start re-enrollment while active key exists -> staged in pending slot
+            val second = (sdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 2 })) as MaigBindResult.Success).value
+            assertEquals(first.keyId, sdk.getEnrolledKeyId("user-1"))
+            assertEquals(second.keyId, sdk.getPendingKeyId("user-1"))
+            assertEquals(2, ks.keys.size)
+
+            // Active key still signs normally if pending re-enrollment is aborted
+            sdk.abortPendingEnrollment("user-1")
+            assertEquals(1, ks.keys.size)
+            assertEquals(first.keyId, sdk.getEnrolledKeyId("user-1"))
+            val txOld =
+                TransactionPayload(
+                    keyId = first.keyId,
+                    operationType = "PIX_TRANSFER",
+                    nonce = "n1",
+                    issuedAt = 100L,
+                    expiresAt = 200L,
+                )
+            assertTrue(sdk.sign(activity, "user-1", txOld, prompt) is MaigBindResult.Success)
+
+            // Now re-enroll, confirm PoP on pending key, and promote
+            val third = (sdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 3 })) as MaigBindResult.Success).value
+            val pop =
+                sdk.confirmEnrollmentPop(
+                    activity = activity,
+                    bindingId = "bind-3",
+                    accountId = "user-1",
+                    popChallengeBase64Url = Base64Url.encode(ByteArray(32) { 4 }),
+                    issuedAt = 100L,
+                    expiresAt = 200L,
+                    promptText = prompt,
+                )
+            assertTrue(pop is MaigBindResult.Success)
+            assertEquals(third.keyId, (pop as MaigBindResult.Success).value.popPayload.keyId)
+
+            sdk.activatePendingEnrollment("user-1")
+            assertEquals(third.keyId, sdk.getEnrolledKeyId("user-1"))
+            assertEquals(null, sdk.getPendingKeyId("user-1"))
+            assertEquals(1, ks.keys.size)
+        }
+
+    @Test
+    fun rejectsFridaHookReturningNullCryptoObjectOrSwappedSignature() =
+        runTest {
+            val ks = FakeKeyStoreGateway()
+            val bioNull = FakeBiometricLauncher { BiometricPromptOutcome.Succeeded(returnedSignature = null) }
+            val sdkNull = MaigBind(MaigBindConfig(), ks, bioNull, InMemorySlotStore())
+            val enrollRes =
+                (
+                    sdkNull.enroll(
+                        "user-1",
+                        Base64Url.encode(ByteArray(32) { 1 }),
+                    ) as MaigBindResult.Success
+                ).value
             val tx =
                 TransactionPayload(
-                    keyId = enrollRes.value.keyId,
+                    keyId = enrollRes.keyId,
                     operationType = "PIX_TRANSFER",
-                    nonce = "nonce-2",
+                    nonce = "n1",
                     issuedAt = 1000L,
                     expiresAt = 2000L,
                 )
-            val signRes = sdk.sign(createActivity(), "user-1", tx, prompt)
-            assertTrue(signRes is MaigBindResult.Failure)
-            assertTrue((signRes as MaigBindResult.Failure).error is MaigBindError.CryptoObjectTampered)
+
+            val resNull = sdkNull.sign(createActivity(), "user-1", tx, prompt)
+            assertTrue((resNull as MaigBindResult.Failure).error is MaigBindError.CryptoObjectTampered)
+
+            val rogueSig = Signature.getInstance("SHA256withECDSA")
+            val bioSwap = FakeBiometricLauncher { BiometricPromptOutcome.Succeeded(returnedSignature = rogueSig) }
+            val slots = InMemorySlotStore()
+            val sdkSwap = MaigBind(MaigBindConfig(), ks, bioSwap, slots)
+            val e2 = (sdkSwap.enroll("user-2", Base64Url.encode(ByteArray(32) { 2 })) as MaigBindResult.Success).value
+            val resSwap = sdkSwap.sign(createActivity(), "user-2", tx.copy(keyId = e2.keyId), prompt)
+            assertTrue((resSwap as MaigBindResult.Failure).error is MaigBindError.CryptoObjectTampered)
         }
 
     @Test
     fun signsWithStrongBiometricAndProducesVerifiableEcdsaSignature() =
         runTest {
             val ks = FakeKeyStoreGateway()
-            val bio = FakeBiometricLauncher()
-            val sdk = MaigBind(MaigBindConfig(), ks, bio)
-
+            val sdk = MaigBind(MaigBindConfig(), ks, FakeBiometricLauncher(), InMemorySlotStore())
             val enroll = (sdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 9 })) as MaigBindResult.Success).value
             assertEquals(SecurityBacking.STRONGBOX, enroll.securityBacking)
 
@@ -190,10 +243,11 @@ class MaigBindAndroidUnitTest {
                     fields = canonicalFields("amountCents" to canonical(50_000L)),
                 )
             val signed = (sdk.sign(createActivity(), "user-1", tx, prompt) as MaigBindResult.Success).value
-            assertEquals(BiometricManager.Authenticators.BIOMETRIC_STRONG, bio.lastAuthenticators)
-            assertEquals(AuthPolicyUsed.BIOMETRIC_STRONG, signed.authMetadata.authPolicyUsed)
-
-            val pubKey = ks.keys["maigbind:user-1"]!!.first.public
+            val pubKey =
+                ks.keys.values
+                    .single()
+                    .first.public
+            assertNotNull(pubKey)
             assertEquals(enroll.keyId, computeKeyId(pubKey.encoded))
             val verifier =
                 Signature.getInstance("SHA256withECDSA").apply {
@@ -204,11 +258,12 @@ class MaigBindAndroidUnitTest {
         }
 
     @Test
-    fun mapsNotEnrolledCancelledLockoutAndBiometricInvalidation() =
+    fun mapsNotEnrolledCancelledLockoutBiometryUnavailableAndInvalidation() =
         runTest {
             val ks = FakeKeyStoreGateway()
             val bio = FakeBiometricLauncher()
-            val sdk = MaigBind(MaigBindConfig(), ks, bio)
+            val slots = InMemorySlotStore()
+            val sdk = MaigBind(MaigBindConfig(), ks, bio, slots)
 
             val missingTx =
                 TransactionPayload(
@@ -218,49 +273,60 @@ class MaigBindAndroidUnitTest {
                     issuedAt = 1L,
                     expiresAt = 2L,
                 )
-            val notEnrolled = sdk.sign(createActivity(), "unknown-user", missingTx, prompt)
-            assertTrue((notEnrolled as MaigBindResult.Failure).error is MaigBindError.NotEnrolled)
+            assertTrue(
+                (
+                    sdk.sign(
+                        createActivity(),
+                        "unknown",
+                        missingTx,
+                        prompt,
+                    ) as MaigBindResult.Failure
+                ).error is MaigBindError.NotEnrolled,
+            )
 
             val enroll = (sdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 2 })) as MaigBindResult.Success).value
             val tx = missingTx.copy(keyId = enroll.keyId)
 
-            bio.outcomeProvider = { BiometricPromptOutcome.Error(BiometricPrompt.ERROR_USER_CANCELED, "Cancelled") }
-            val cancelled = sdk.sign(createActivity(), "user-1", tx, prompt)
-            assertTrue((cancelled as MaigBindResult.Failure).error is MaigBindError.Cancelled)
+            bio.outcomeProvider =
+                { BiometricPromptOutcome.Error(androidx.biometric.BiometricPrompt.ERROR_USER_CANCELED, "Cancelled") }
+            assertTrue(
+                (
+                    sdk.sign(
+                        createActivity(),
+                        "user-1",
+                        tx,
+                        prompt,
+                    ) as MaigBindResult.Failure
+                ).error is MaigBindError.Cancelled,
+            )
 
-            bio.outcomeProvider = { BiometricPromptOutcome.Error(BiometricPrompt.ERROR_LOCKOUT_PERMANENT, "Locked") }
-            val lockout = sdk.sign(createActivity(), "user-1", tx, prompt)
-            val lockoutErr = (lockout as MaigBindResult.Failure).error as MaigBindError.Lockout
+            bio.outcomeProvider =
+                { BiometricPromptOutcome.Error(androidx.biometric.BiometricPrompt.ERROR_LOCKOUT_PERMANENT, "Locked") }
+            val lockoutErr =
+                (
+                    sdk.sign(
+                        createActivity(),
+                        "user-1",
+                        tx,
+                        prompt,
+                    ) as MaigBindResult.Failure
+                ).error as MaigBindError.Lockout
             assertTrue(lockoutErr.isPermanent)
 
-            // Simulate KeyPermanentlyInvalidatedException when Signature.initSign is invoked
             val invalidatedSdk =
                 MaigBind(
                     config = MaigBindConfig(),
                     keyStoreGateway = ks,
                     biometricLauncher = FakeBiometricLauncher(),
-                    signatureFactory = {
-                        throw KeyPermanentlyInvalidatedException("New fingerprint added")
-                    },
+                    aliasSlotStore = slots,
+                    signatureFactory = { throw KeyPermanentlyInvalidatedException("New fingerprint added") },
                 )
             val needsReEnroll = invalidatedSdk.sign(createActivity(), "user-1", tx, prompt)
             assertTrue((needsReEnroll as MaigBindResult.Failure).error is MaigBindError.NeedsReEnrollment)
             assertFalse(invalidatedSdk.hasEnrolledKey("user-1"))
-        }
 
-    @Test
-    fun blocksWeakBiometricByDefaultAndFlagsExplicitOptIn() =
-        runTest {
-            val ks = FakeKeyStoreGateway()
-            val bio = FakeBiometricLauncher(capability = BiometricCapability.READY_WEAK_ONLY)
-
-            val strictSdk = MaigBind(MaigBindConfig(allowWeakBiometricFallback = false), ks, bio)
-            val blocked = strictSdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 3 }))
-            assertTrue((blocked as MaigBindResult.Failure).error is MaigBindError.BiometryUnavailable)
-
-            val optInSdk = MaigBind(MaigBindConfig(allowWeakBiometricFallback = true), ks, bio)
-            val allowed = optInSdk.enroll("user-1", Base64Url.encode(ByteArray(32) { 3 }))
-            assertTrue(allowed is MaigBindResult.Success)
-            assertEquals(AuthPolicyUsed.BIOMETRIC_WEAK_OPT_IN, (allowed as MaigBindResult.Success).value.authPolicyUsed)
+            bio.capability = BiometricCapability.NONE_ENROLLED
+            val noBio = sdk.enroll("user-no-bio", Base64Url.encode(ByteArray(32) { 4 }))
+            assertTrue((noBio as MaigBindResult.Failure).error is MaigBindError.BiometryNotEnrolled)
         }
 }

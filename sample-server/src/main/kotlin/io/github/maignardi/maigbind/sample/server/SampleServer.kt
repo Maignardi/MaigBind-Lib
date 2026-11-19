@@ -74,6 +74,17 @@ public data class ErrorHttpResponse(
     val error: String,
 )
 
+@Serializable
+public data class RevokeBindingHttpRequest(
+    val bindingId: String? = null,
+    val accountId: String? = null,
+)
+
+@Serializable
+public data class RevokeBindingHttpResponse(
+    val revokedCount: Int,
+)
+
 public const val DEMO_VALID_STEP_UP_TOKEN: String = "stepup-mfa-verified"
 
 /**
@@ -145,6 +156,17 @@ private fun Route.enrollmentRoutes(
         val resp = verifier.confirmEnrollmentPop(req)
         val status = if (resp.verdict.isVerified) HttpStatusCode.OK else HttpStatusCode.Forbidden
         call.respond(status, resp)
+    }
+
+    post("/bindings/revoke") {
+        val req = call.receive<RevokeBindingHttpRequest>()
+        val revoked =
+            when {
+                !req.bindingId.isNullOrBlank() -> if (verifier.revokeBinding(req.bindingId)) 1 else 0
+                !req.accountId.isNullOrBlank() -> verifier.revokeAccountBindings(req.accountId)
+                else -> throw IllegalArgumentException("Either bindingId or accountId must be provided")
+            }
+        call.respond(HttpStatusCode.OK, RevokeBindingHttpResponse(revokedCount = revoked))
     }
 }
 

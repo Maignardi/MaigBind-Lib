@@ -162,6 +162,7 @@ public data class DeviceBinding(
     val issuerBatchKey: String?,
     val createdAtMillis: Long,
     val activatedAtMillis: Long? = null,
+    val revokedAtMillis: Long? = null,
 )
 
 /** Storage interface for enrolled device key bindings. */
@@ -176,6 +177,18 @@ public interface BindingStore {
     ): DeviceBinding?
 
     public fun findActiveByAccount(accountId: String): List<DeviceBinding>
+
+    /** Marks [bindingId] as [EnrollmentStatus.REVOKED] if found and not already revoked. */
+    public fun revoke(
+        bindingId: String,
+        revokedAtMillis: Long,
+    ): Boolean
+
+    /** Marks all non-revoked bindings for [accountId] as [EnrollmentStatus.REVOKED]. */
+    public fun revokeAllForAccount(
+        accountId: String,
+        revokedAtMillis: Long,
+    ): Int
 }
 
 /** Thread-safe in-memory [BindingStore]. */
@@ -197,30 +210,68 @@ public class InMemoryBindingStore : BindingStore {
 
     override fun findActiveByAccount(accountId: String): List<DeviceBinding> =
         byBindingId.values.filter { it.accountId == accountId && it.status == EnrollmentStatus.ACTIVE }
+
+    override fun revoke(
+        bindingId: String,
+        revokedAtMillis: Long,
+    ): Boolean {
+        val current = byBindingId[bindingId] ?: return false
+        if (current.status == EnrollmentStatus.REVOKED) return false
+        val updated = current.copy(status = EnrollmentStatus.REVOKED, revokedAtMillis = revokedAtMillis)
+        save(updated)
+        return true
+    }
+
+    override fun revokeAllForAccount(
+        accountId: String,
+        revokedAtMillis: Long,
+    ): Int {
+        var count = 0
+        for (binding in byBindingId.values) {
+            if (binding.accountId == accountId && binding.status != EnrollmentStatus.REVOKED) {
+                save(binding.copy(status = EnrollmentStatus.REVOKED, revokedAtMillis = revokedAtMillis))
+                count++
+            }
+        }
+        return count
+    }
 }
 
 /**
- * Heuristic tracker detecting when the same intermediate/batch attestation certificate is shared
- * across suspiciously many distinct accounts (a strong indicator of a leaked OEM factory keybox).
+ * **Experimental** velocity tracker observing how many distinct accounts enroll with the same
+ * leaf-adjacent batch attestation certificate within a sliding time window.
+ *
+ * Note: Google factory batch certificates are legitimately shared across ~100,000+ devices of a
+ * product line; lifetime counting would trigger mass false positives. Only high-velocity bursts
+ * inside a short time window should be surfaced as telemetry.
  */
 public interface KeyboxUsageTracker {
-    /** Records [accountId] using [batchCertKey] and returns the distinct account count observed. */
-    public fun recordAndCountDistinctAccounts(
+    /**
+     * Records [accountId] using [batchCertKey] at [nowMillis] and returns the distinct account count
+     * observed within `[nowMillis - windowMillis, nowMillis]`.
+     */
+    public fun recordAndCountInWindow(
         batchCertKey: String,
         accountId: String,
+        nowMillis: Long,
+        windowMillis: Long,
     ): Int
 }
 
-/** Thread-safe in-memory [KeyboxUsageTracker]. */
+/** Thread-safe in-memory windowed [KeyboxUsageTracker]. */
 public class InMemoryKeyboxUsageTracker : KeyboxUsageTracker {
-    private val accountsByBatchKey = ConcurrentHashMap<String, MutableSet<String>>()
+    private val eventsByBatchKey = ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>()
 
-    override fun recordAndCountDistinctAccounts(
+    override fun recordAndCountInWindow(
         batchCertKey: String,
         accountId: String,
+        nowMillis: Long,
+        windowMillis: Long,
     ): Int {
-        val set = accountsByBatchKey.computeIfAbsent(batchCertKey) { ConcurrentHashMap.newKeySet() }
-        set.add(accountId)
-        return set.size
+        val accountTimestamps = eventsByBatchKey.computeIfAbsent(batchCertKey) { ConcurrentHashMap() }
+        accountTimestamps[accountId] = nowMillis
+        val cutoff = nowMillis - windowMillis
+        accountTimestamps.entries.removeIf { it.value < cutoff }
+        return accountTimestamps.size
     }
 }

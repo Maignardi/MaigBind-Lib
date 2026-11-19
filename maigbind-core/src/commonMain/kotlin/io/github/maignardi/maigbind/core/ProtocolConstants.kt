@@ -58,21 +58,6 @@ public enum class SecurityBacking {
 }
 
 /**
- * Indicates the biometric authentication policy enforced during signing.
- */
-@Serializable
-public enum class AuthPolicyUsed {
-    /** Hardware-backed Class 3 strong biometrics (`BIOMETRIC_STRONG` / `.biometryCurrentSet`). */
-    BIOMETRIC_STRONG,
-
-    /**
-     * Weak biometrics explicitly opted into by the caller.
-     * Rejected by default `VerificationPolicy` unless explicitly permitted.
-     */
-    BIOMETRIC_WEAK_OPT_IN,
-}
-
-/**
  * Human-readable transaction summary displayed in the OS biometric confirmation prompt.
  *
  * Note: Android Protected Confirmation (`ConfirmationPrompt`) was deprecated/abandoned due to

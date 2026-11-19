@@ -1,6 +1,5 @@
 package io.github.maignardi.maigbind.android
 
-import io.github.maignardi.maigbind.core.AuthPolicyUsed
 import io.github.maignardi.maigbind.core.SecurityBacking
 import java.security.PrivateKey
 import java.security.Signature
@@ -13,21 +12,17 @@ import java.security.Signature
  * @property requireStrongBox If `true`, fail with `HardwareUnavailable` instead of falling back
  * to TEE when StrongBox is unavailable.
  * @property includeDevicePropertiesAttestation Requests `setDevicePropertiesAttestationIncluded(true)`
- * on API 31+ when permitted by the device; falls back if unsupported unless strict.
- * @property allowWeakBiometricFallback Allows `BIOMETRIC_WEAK` if explicitly requested by policy.
- * Defaults to `false` (strict `BIOMETRIC_STRONG` only). Never allows `DEVICE_CREDENTIAL` fallback.
+ * on API 31+ when permitted by the device; falls back if unsupported on either StrongBox or TEE.
  */
 public data class MaigBindConfig(
     val preferStrongBox: Boolean = true,
     val requireStrongBox: Boolean = false,
     val includeDevicePropertiesAttestation: Boolean = false,
-    val allowWeakBiometricFallback: Boolean = false,
 )
 
 /** Current biometric hardware and enrollment status on the device. */
 public enum class BiometricCapability {
     READY_STRONG,
-    READY_WEAK_ONLY,
     NONE_ENROLLED,
     HARDWARE_UNAVAILABLE,
     NO_HARDWARE,
@@ -62,6 +57,23 @@ internal interface AndroidKeyStoreGateway {
     fun deleteKey(alias: String)
 }
 
+/** Tracks active and staged-pending Keystore aliases per hashed account without storing PII. */
+internal interface KeyAliasSlotStore {
+    fun getActiveAlias(accountHash: String): String?
+
+    fun setActiveAlias(
+        accountHash: String,
+        alias: String?,
+    )
+
+    fun getPendingAlias(accountHash: String): String?
+
+    fun setPendingAlias(
+        accountHash: String,
+        alias: String?,
+    )
+}
+
 /** Result delivered by [BiometricPromptLauncher] after displaying the OS biometric prompt. */
 internal sealed class BiometricPromptOutcome {
     data class Succeeded(
@@ -76,7 +88,7 @@ internal sealed class BiometricPromptOutcome {
 
 /** Abstraction over `androidx.biometric.BiometricPrompt` for testable callback/CryptoObject verification. */
 internal interface BiometricPromptLauncher {
-    fun checkCapability(allowWeak: Boolean): BiometricCapability
+    fun checkCapability(): BiometricCapability
 
     suspend fun authenticate(
         activity: androidx.fragment.app.FragmentActivity,
@@ -84,10 +96,6 @@ internal interface BiometricPromptLauncher {
         subtitle: String?,
         description: String?,
         negativeButtonText: String,
-        authenticators: Int,
         signature: Signature,
     ): BiometricPromptOutcome
-
-    fun expectedAuthPolicy(allowWeak: Boolean): AuthPolicyUsed =
-        if (allowWeak) AuthPolicyUsed.BIOMETRIC_WEAK_OPT_IN else AuthPolicyUsed.BIOMETRIC_STRONG
 }

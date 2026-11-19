@@ -260,7 +260,12 @@ class GoogleSampleChainsAndEdgeCasesTest {
             )
         val verifier =
             MaigBindVerifier(
-                policy = VerificationPolicy(keyboxSuspicionThreshold = 2, rejectOnSuspiciousKeybox = false),
+                policy =
+                    VerificationPolicy(
+                        keyboxSuspicionThreshold = 2,
+                        keyboxSuspicionWindowMinutes = 10L,
+                        rejectOnSuspiciousKeybox = false,
+                    ),
                 trustStoreProvider = StaticTrustStoreProvider(listOf(factoryRoot.cert)),
                 revocationStatusProvider = StaticRevocationStatusProvider(),
                 clock = fixedClock,

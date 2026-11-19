@@ -1,6 +1,5 @@
 package io.github.maignardi.maigbind.verifier
 
-import io.github.maignardi.maigbind.core.AuthPolicyUsed
 import io.github.maignardi.maigbind.core.Base64Url
 import io.github.maignardi.maigbind.core.CanonicalValue
 import io.github.maignardi.maigbind.core.EnrollmentAttestResponse
@@ -44,8 +43,8 @@ public data class TransactionChallengeResponse(
 
 /**
  * Server-side verifier implementing Android hardware key attestation validation, Google CRL
- * revocation checking, immediate Proof-of-Possession enrollment confirmation, and per-transaction
- * ECDSA signature and payload integrity verification.
+ * revocation checking, immediate Proof-of-Possession enrollment confirmation, binding revocation,
+ * and per-transaction ECDSA signature and payload integrity verification.
  */
 public class MaigBindVerifier(
     private val policy: VerificationPolicy = VerificationPolicy(),
@@ -143,7 +142,7 @@ public class MaigBindVerifier(
         )
 
         val batchKey = attestationValidator.computeBatchKey(certificates, matchedRoot)
-        checkKeyboxFanOut(isRkpChain, batchKey, request.accountId, findings)
+        checkKeyboxFanOut(isRkpChain, batchKey, request.accountId, now, findings)
 
         if (findings.any { it.severity == FindingSeverity.CRITICAL }) {
             return rejectAttest(request.keyId, classifyRejection(findings), findings)
@@ -154,7 +153,8 @@ public class MaigBindVerifier(
 
     /**
      * Step 2 of enrollment: verifies the immediate biometric-unlocked Proof-of-Possession signature
-     * using the enrolled public key and activates the binding.
+     * using the enrolled public key, enforces [VerificationPolicy.maxActiveBindingsPerAccount]
+     * (revoking oldest superseded active bindings), and activates the binding.
      */
     public fun confirmEnrollmentPop(request: EnrollmentConfirmRequest): EnrollmentConfirmResponse {
         val findings = mutableListOf<Finding>()
@@ -199,6 +199,7 @@ public class MaigBindVerifier(
             return rejectPop(binding, VerdictStatus.REJECTED_FRAUD_SIGNAL, findings)
         }
 
+        enforceMaxActiveBindings(binding.accountId, binding.bindingId, now)
         val activated = binding.copy(status = EnrollmentStatus.ACTIVE, activatedAtMillis = now)
         bindingStore.save(activated)
 
@@ -215,6 +216,32 @@ public class MaigBindVerifier(
                     findings = listOf(Finding(FindingCode.OK, FindingSeverity.INFO, "Device binding activated")),
                 ),
         )
+    }
+
+    /**
+     * Revokes a specific device [bindingId] (e.g., stolen phone or "remove this device" action).
+     *
+     * @return `true` if the binding existed and transitioned to [EnrollmentStatus.REVOKED].
+     */
+    public fun revokeBinding(bindingId: String): Boolean {
+        require(bindingId.isNotBlank()) { "bindingId must not be blank" }
+        return bindingStore.revoke(bindingId, clock.millis())
+    }
+
+    /**
+     * Revokes all non-revoked device bindings for [accountId] (e.g., account takeover response).
+     *
+     * @return the number of bindings revoked.
+     */
+    public fun revokeAccountBindings(accountId: String): Int {
+        require(accountId.isNotBlank()) { "accountId must not be blank" }
+        return bindingStore.revokeAllForAccount(accountId, clock.millis())
+    }
+
+    /** Returns all currently [EnrollmentStatus.ACTIVE] bindings for [accountId]. */
+    public fun getActiveBindings(accountId: String): List<DeviceBinding> {
+        require(accountId.isNotBlank()) { "accountId must not be blank" }
+        return bindingStore.findActiveByAccount(accountId)
     }
 
     /**
@@ -273,9 +300,13 @@ public class MaigBindVerifier(
             return VerificationVerdict(VerdictStatus.REJECTED_FRAUD_SIGNAL, payload.keyId, findings = findings)
         }
 
-        val policyFailure = checkTransactionPolicy(binding, signedPayload, findings)
-        if (policyFailure != null) {
-            return bindingVerdict(binding, policyFailure, findings)
+        if (policy.requireStrongBox && binding.securityBacking != SecurityBacking.STRONGBOX) {
+            findings +=
+                critical(
+                    FindingCode.STRONGBOX_REQUIRED,
+                    "Policy requires StrongBox backing, found ${binding.securityBacking}",
+                )
+            return bindingVerdict(binding, VerdictStatus.REJECTED_POLICY, findings)
         }
 
         val cryptoFailure = checkTransactionFreshnessAndSignature(binding, signedPayload, now, findings)
@@ -306,6 +337,25 @@ public class MaigBindVerifier(
             VerdictStatus.VERIFIED,
             listOf(Finding(FindingCode.OK, FindingSeverity.INFO, "Transaction signature and payload verified")),
         )
+    }
+
+    private fun enforceMaxActiveBindings(
+        accountId: String,
+        newBindingId: String,
+        nowMillis: Long,
+    ) {
+        val existingActive =
+            bindingStore
+                .findActiveByAccount(accountId)
+                .filter { it.bindingId != newBindingId }
+                .sortedBy { it.activatedAtMillis ?: it.createdAtMillis }
+        val allowedPrior = policy.maxActiveBindingsPerAccount - 1
+        val excess = existingActive.size - allowedPrior
+        if (excess > 0) {
+            for (oldBinding in existingActive.take(excess)) {
+                bindingStore.revoke(oldBinding.bindingId, nowMillis)
+            }
+        }
     }
 
     private fun decodeAndCheckChallenge(
@@ -388,17 +438,22 @@ public class MaigBindVerifier(
         isRkpChain: Boolean,
         batchKey: String?,
         accountId: String,
+        nowMillis: Long,
         findings: MutableList<Finding>,
     ) {
         if (isRkpChain || batchKey == null) return
-        val distinctAccounts = keyboxUsageTracker.recordAndCountDistinctAccounts(batchKey, accountId)
+        val windowMillis = policy.keyboxSuspicionWindowMinutes * 60_000L
+        val distinctAccounts =
+            keyboxUsageTracker.recordAndCountInWindow(batchKey, accountId, nowMillis, windowMillis)
         if (distinctAccounts >= policy.keyboxSuspicionThreshold) {
             val sev = if (policy.rejectOnSuspiciousKeybox) FindingSeverity.CRITICAL else FindingSeverity.WARNING
             findings +=
                 Finding(
                     code = FindingCode.SUSPICIOUS_KEYBOX_FANOUT,
                     severity = sev,
-                    message = "Batch attestation CA attested $distinctAccounts distinct accounts",
+                    message =
+                        "Batch attestation CA attested $distinctAccounts distinct accounts " +
+                            "within ${policy.keyboxSuspicionWindowMinutes}m",
                     details = mapOf("batchKey" to batchKey, "distinctAccounts" to distinctAccounts.toString()),
                 )
         }
@@ -469,16 +524,6 @@ public class MaigBindVerifier(
             findings += critical(FindingCode.KEY_ID_MISMATCH, "PoP payload keyId/accountId mismatch")
             return VerdictStatus.REJECTED_FRAUD_SIGNAL
         }
-        if (!policy.allowWeakBiometricOptIn &&
-            request.authMetadata.authPolicyUsed == AuthPolicyUsed.BIOMETRIC_WEAK_OPT_IN
-        ) {
-            findings +=
-                critical(
-                    FindingCode.DOWNGRADED_AUTH_POLICY_REJECTED,
-                    "Weak biometric opt-in is disallowed by server policy",
-                )
-            return VerdictStatus.REJECTED_POLICY
-        }
         val challengeBytes = runCatching { Base64Url.decode(request.popPayload.challenge) }.getOrNull()
         if (challengeBytes == null ||
             !challengeStore.consumeChallenge(popChallengeKey(binding.bindingId), challengeBytes, now)
@@ -498,32 +543,6 @@ public class MaigBindVerifier(
                     "PoP payload timestamps outside allowed validity window",
                 )
             return VerdictStatus.REJECTED_FRAUD_SIGNAL
-        }
-        return null
-    }
-
-    private fun checkTransactionPolicy(
-        binding: DeviceBinding,
-        signedPayload: SignedPayload,
-        findings: MutableList<Finding>,
-    ): VerdictStatus? {
-        if (!policy.allowWeakBiometricOptIn &&
-            signedPayload.authMetadata.authPolicyUsed == AuthPolicyUsed.BIOMETRIC_WEAK_OPT_IN
-        ) {
-            findings +=
-                critical(
-                    FindingCode.DOWNGRADED_AUTH_POLICY_REJECTED,
-                    "Transaction used BIOMETRIC_WEAK_OPT_IN which is rejected by policy",
-                )
-            return VerdictStatus.REJECTED_POLICY
-        }
-        if (policy.requireStrongBox && binding.securityBacking != SecurityBacking.STRONGBOX) {
-            findings +=
-                critical(
-                    FindingCode.STRONGBOX_REQUIRED,
-                    "Policy requires StrongBox backing, found ${binding.securityBacking}",
-                )
-            return VerdictStatus.REJECTED_POLICY
         }
         return null
     }
@@ -599,9 +618,12 @@ public class MaigBindVerifier(
                 FindingCode.STRONGBOX_REQUIRED,
                 FindingCode.OS_PATCH_LEVEL_TOO_LOW,
                 FindingCode.FACTORY_KEY_NOT_ALLOWED,
-                FindingCode.DOWNGRADED_AUTH_POLICY_REJECTED,
             )
-        val criticalCodes = findings.filter { it.severity == FindingSeverity.CRITICAL }.map { it.code }.toSet()
+        val criticalCodes =
+            findings
+                .filter { it.severity == FindingSeverity.CRITICAL }
+                .map { it.code }
+                .toSet()
         return if (criticalCodes.isNotEmpty() && criticalCodes.all { it in policyOnlyCodes }) {
             VerdictStatus.REJECTED_POLICY
         } else {

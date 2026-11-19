@@ -95,6 +95,7 @@ public class MainActivity : FragmentActivity() {
             log("3/4 Submitting attestation chain to sample-server...")
             val attestResp = api.attestEnrollment(enrollReq)
             if (!attestResp.verdict.isVerified) {
+                maigBind.abortPendingEnrollment(accountId)
                 val codes = attestResp.verdict.findings.joinToString { "${it.code}:${it.message}" }
                 log("Server rejected attestation (${attestResp.verdict.status}): $codes")
                 return
@@ -120,6 +121,7 @@ public class MainActivity : FragmentActivity() {
                         )
                 ) {
                     is MaigBindResult.Failure -> {
+                        maigBind.abortPendingEnrollment(accountId)
                         log("PoP biometric failed: ${res.error.message}")
                         return
                     }
@@ -127,6 +129,11 @@ public class MainActivity : FragmentActivity() {
                 }
 
             val confirmResp = api.confirmEnrollment(popReq)
+            if (confirmResp.status == io.github.maignardi.maigbind.core.EnrollmentStatus.ACTIVE) {
+                maigBind.activatePendingEnrollment(accountId)
+            } else {
+                maigBind.abortPendingEnrollment(accountId)
+            }
             log("Enrollment status: ${confirmResp.status} (${confirmResp.verdict.status})")
         }.onFailure { ex ->
             log("Enrollment error: ${ex.message}")

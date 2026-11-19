@@ -327,11 +327,11 @@ internal class AttestationValidator(
         certificates: List<X509Certificate>,
         matchedRoot: X509Certificate,
     ): String? {
-        val intermediate =
-            certificates.lastOrNull {
-                !it.encoded.contentEquals(matchedRoot.encoded) && it != certificates.first()
-            } ?: return null
-        return "${intermediate.issuerX500Principal.name}#${intermediate.serialNumber.toString(16)}"
+        // Use the batch certificate closest to the leaf (index 1 in leaf-first chains), NOT the
+        // root-adjacent intermediate which spans entire device lines across millions of handsets.
+        val leafAdjacentBatch = certificates.getOrNull(1) ?: return null
+        if (leafAdjacentBatch.encoded.contentEquals(matchedRoot.encoded)) return null
+        return "${leafAdjacentBatch.issuerX500Principal.name}#${leafAdjacentBatch.serialNumber.toString(16)}"
     }
 
     private fun critical(

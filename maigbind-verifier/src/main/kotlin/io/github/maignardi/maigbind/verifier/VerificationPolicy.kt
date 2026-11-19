@@ -65,21 +65,32 @@ public data class ExpectedAndroidApp(
 
 /**
  * Configurable security policy enforced by [MaigBindVerifier].
+ *
+ * @property maxActiveBindingsPerAccount Maximum number of simultaneously `ACTIVE` bindings per
+ * account (`1` by default). When a new device binding completes Proof-of-Possession, older active
+ * bindings exceeding this limit are automatically revoked.
+ * @property keyboxSuspicionThreshold **Experimental** burst threshold of distinct accounts using the
+ * same leaf-adjacent factory batch certificate within [keyboxSuspicionWindowMinutes].
+ * @property keyboxSuspicionWindowMinutes Sliding time window in minutes for the experimental
+ * keybox fan-out telemetry heuristic.
  */
 public data class VerificationPolicy(
     val requireStrongBox: Boolean = false,
     val minOsPatchLevel: Int? = null,
     val allowFactoryKeys: Boolean = true,
-    val allowWeakBiometricOptIn: Boolean = false,
     val requireUnlockedDeviceTag: Boolean = false,
     val expectedApps: List<ExpectedAndroidApp> = emptyList(),
     val failMode: FailMode = FailMode.FAIL_CLOSED,
     val clockSkewSeconds: Long = 60L,
-    val keyboxSuspicionThreshold: Int = 50,
+    val maxActiveBindingsPerAccount: Int = 1,
+    val keyboxSuspicionThreshold: Int = 1_000,
+    val keyboxSuspicionWindowMinutes: Long = 10L,
     val rejectOnSuspiciousKeybox: Boolean = false,
 ) {
     init {
         require(clockSkewSeconds >= 0L) { "clockSkewSeconds must be >= 0" }
+        require(maxActiveBindingsPerAccount > 0) { "maxActiveBindingsPerAccount must be > 0" }
         require(keyboxSuspicionThreshold > 0) { "keyboxSuspicionThreshold must be > 0" }
+        require(keyboxSuspicionWindowMinutes > 0L) { "keyboxSuspicionWindowMinutes must be > 0" }
     }
 }

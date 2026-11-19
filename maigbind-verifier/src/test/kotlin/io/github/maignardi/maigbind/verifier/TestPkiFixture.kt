@@ -1,9 +1,6 @@
 package io.github.maignardi.maigbind.verifier
 
-import io.github.maignardi.maigbind.core.AuthPolicyUsed
 import io.github.maignardi.maigbind.core.Base64Url
-import io.github.maignardi.maigbind.core.ClientAuthMetadata
-import io.github.maignardi.maigbind.core.SecurityBacking
 import io.github.maignardi.maigbind.core.SignedPayload
 import io.github.maignardi.maigbind.core.TransactionPayload
 import io.github.maignardi.maigbind.core.canonical
@@ -83,7 +80,6 @@ internal object TestPkiFixture {
         return SignedPayload(
             payload = payload,
             signatureBase64Url = Base64Url.encode(ecdsaSign(keyPair.private, payload.signingInput())),
-            authMetadata = ClientAuthMetadata(SecurityBacking.STRONGBOX, AuthPolicyUsed.BIOMETRIC_STRONG),
         )
     }
 
