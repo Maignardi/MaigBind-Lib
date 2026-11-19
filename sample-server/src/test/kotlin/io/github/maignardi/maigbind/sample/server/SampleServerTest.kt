@@ -18,6 +18,7 @@ import io.github.maignardi.maigbind.verifier.KEY_ATTESTATION_OID
 import io.github.maignardi.maigbind.verifier.MaigBindVerifier
 import io.github.maignardi.maigbind.verifier.StaticRevocationStatusProvider
 import io.github.maignardi.maigbind.verifier.StaticTrustStoreProvider
+import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
@@ -123,6 +124,40 @@ class SampleServerTest {
             val replayBody = json.decodeFromString<ExecuteTransferHttpResponse>(replayResp.bodyAsText())
             assertFalse(replayBody.executed)
             assertTrue(replayBody.verdict.findings.any { it.code == FindingCode.NONCE_REPLAYED_OR_UNKNOWN })
+        }
+
+    @Test
+    fun queriesActiveBindingAndRevokesViaHttp() =
+        testApplication {
+            val (rootCert, rootKp) = createRkpRootCa()
+            val verifier =
+                MaigBindVerifier(
+                    trustStoreProvider = StaticTrustStoreProvider(listOf(rootCert)),
+                    revocationStatusProvider = StaticRevocationStatusProvider(),
+                    clock = fixedClock,
+                )
+            application { configureSampleServer(verifier) }
+
+            val initial = client.get("/bindings/active?accountId=acct-99")
+            assertEquals(HttpStatusCode.OK, initial.status)
+            assertEquals(null, json.decodeFromString<ActiveBindingHttpResponse>(initial.bodyAsText()).activeKeyId)
+
+            val (_, keyId) = enrollViaHttp(client, rootCert, rootKp)
+            val afterEnroll = client.get("/bindings/active?accountId=acct-99")
+            assertEquals(HttpStatusCode.OK, afterEnroll.status)
+            val activeResp = json.decodeFromString<ActiveBindingHttpResponse>(afterEnroll.bodyAsText())
+            assertEquals(keyId, activeResp.activeKeyId)
+
+            val revokeResp =
+                client.post("/bindings/revoke") {
+                    contentType(ContentType.Application.Json)
+                    setBody(json.encodeToString(RevokeBindingHttpRequest(bindingId = activeResp.bindingId)))
+                }
+            assertEquals(HttpStatusCode.OK, revokeResp.status)
+            assertEquals(1, json.decodeFromString<RevokeBindingHttpResponse>(revokeResp.bodyAsText()).revokedCount)
+
+            val afterRevoke = client.get("/bindings/active?accountId=acct-99")
+            assertEquals(null, json.decodeFromString<ActiveBindingHttpResponse>(afterRevoke.bodyAsText()).activeKeyId)
         }
 
     private fun createRkpRootCa(): Pair<X509Certificate, KeyPair> {

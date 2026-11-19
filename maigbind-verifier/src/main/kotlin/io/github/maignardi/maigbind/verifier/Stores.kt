@@ -163,6 +163,7 @@ public data class DeviceBinding(
     val createdAtMillis: Long,
     val activatedAtMillis: Long? = null,
     val revokedAtMillis: Long? = null,
+    val pendingExpiresAtMillis: Long? = null,
 )
 
 /** Storage interface for enrolled device key bindings. */
@@ -189,6 +190,14 @@ public interface BindingStore {
         accountId: String,
         revokedAtMillis: Long,
     ): Int
+
+    /**
+     * Removes [EnrollmentStatus.PENDING_POP] bindings whose [DeviceBinding.pendingExpiresAtMillis]
+     * is strictly before [nowMillis].
+     *
+     * @return the number of expired pending bindings purged.
+     */
+    public fun purgeExpiredPending(nowMillis: Long): Int = 0
 }
 
 /** Thread-safe in-memory [BindingStore]. */
@@ -235,6 +244,23 @@ public class InMemoryBindingStore : BindingStore {
         }
         return count
     }
+
+    override fun purgeExpiredPending(nowMillis: Long): Int {
+        var purged = 0
+        for ((bindingId, binding) in byBindingId) {
+            val expiresAt = binding.pendingExpiresAtMillis
+            if (binding.status == EnrollmentStatus.PENDING_POP &&
+                expiresAt != null &&
+                nowMillis > expiresAt
+            ) {
+                if (byBindingId.remove(bindingId, binding)) {
+                    byAccountKey.remove("${binding.accountId}::${binding.keyId}", binding)
+                    purged++
+                }
+            }
+        }
+        return purged
+    }
 }
 
 /**
@@ -258,7 +284,13 @@ public interface KeyboxUsageTracker {
     ): Int
 }
 
-/** Thread-safe in-memory windowed [KeyboxUsageTracker]. */
+/**
+ * Thread-safe in-memory windowed [KeyboxUsageTracker].
+ *
+ * **Not for production use:** retains batch certificate map keys in memory indefinitely without
+ * outer-map eviction. Production deployments should use a bounded or TTL-backed store (such as
+ * Redis sorted sets or hashes with `EXPIRE`).
+ */
 public class InMemoryKeyboxUsageTracker : KeyboxUsageTracker {
     private val eventsByBatchKey = ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>()
 

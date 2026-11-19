@@ -1,6 +1,6 @@
-# MaigBind
+# MaigBind — Hardware-Backed Biometric Signing & Key Attestation Library
 
-[![CI](https://github.com/Maignardi/maigbind/actions/workflows/ci.yml/badge.svg)](https://github.com/Maignardi/maigbind/actions/workflows/ci.yml)
+[![CI](https://github.com/Maignardi/MaigBind-Lib/actions/workflows/ci.yml/badge.svg)](https://github.com/Maignardi/MaigBind-Lib/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 **Hardware-backed biometric transaction signing, device key binding, and server-side Android Key Attestation verification for banking and fintech apps.**
@@ -118,6 +118,8 @@ check(confirmResp.status == EnrollmentStatus.ACTIVE)
 verifier.revokeBinding(bindingId)
 // or revoke all devices on account takeover:
 verifier.revokeAccountBindings(user.id)
+// Periodic cleanup for abandoned PENDING_POP enrollments:
+verifier.purgeExpiredPendingEnrollments()
 
 // Transaction Step A: Issue single-use nonce bound to active keyId
 val txChallenge = verifier.issueTransactionNonce(accountId = user.id, keyId = keyId, ttlSeconds = 90)
@@ -161,7 +163,7 @@ when (maigBind.getBiometricCapability()) {
     else -> { /* show unsupported / fallback UX */ }
 }
 
-// Enrollment Step 1: Generate hardware key (stages safely without overwriting an active key)
+// Enrollment Step 1: Generate hardware key (always stages as pending — even first-time enrollment)
 val enrollReq = when (val res = maigBind.enroll(accountId, beginResp.challengeBase64Url)) {
     is MaigBindResult.Success -> res.value
     is MaigBindResult.Failure -> return handleMaigBindError(res.error)
@@ -195,9 +197,20 @@ val popReq = when (
 }
 val confirmResp = api.postEnrollConfirm(popReq)
 if (confirmResp.status == EnrollmentStatus.ACTIVE) {
-    maigBind.activatePendingEnrollment(accountId) // promotes pending key & deletes superseded key
+    maigBind.activatePendingEnrollment(accountId) // atomically promotes pending key & deletes superseded key
 } else {
     maigBind.abortPendingEnrollment(accountId)
+}
+
+// Crash recovery on app launch: query server's active keyId (e.g. GET /bindings/active)
+when (val sync = maigBind.reconcileActiveKey(accountId, serverActiveKeyId)) {
+    is MaigBindResult.Success -> when (sync.value) {
+        ReconciliationOutcome.PROMOTED_PENDING -> { /* crash happened right after server ACTIVE; recovered */ }
+        ReconciliationOutcome.NEEDS_RE_ENROLLMENT -> startStepUpEnrollment()
+        ReconciliationOutcome.UP_TO_DATE,
+        ReconciliationOutcome.NOT_ENROLLED -> { /* expected steady state */ }
+    }
+    is MaigBindResult.Failure -> handleMaigBindError(sync.error)
 }
 
 // Signing a sensitive operation
@@ -253,6 +266,27 @@ fun handleMaigBindError(error: MaigBindError) {
         is MaigBindError.PlatformFailure -> showGenericError(error.message)
     }
 }
+```
+
+#### Exclude `maigbind_slots.xml` from Android Auto Backup
+
+MaigBind stores per-install alias salts and active/pending alias pointers in `SharedPreferences` (`maigbind_slots.xml`), while the hardware keys themselves remain non-exportable inside that device's Android Keystore. If Auto Backup restores `maigbind_slots.xml` onto a new phone or clean reinstall, those alias pointers will reference non-existent hardware keys (falling back to `NotEnrolled`). Exclude it in your manifest's backup rules:
+
+```xml
+<!-- res/xml/data_extraction_rules.xml (Android 12+) -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="maigbind_slots.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="maigbind_slots.xml" />
+    </device-transfer>
+</data-extraction-rules>
+
+<!-- res/xml/backup_rules.xml (Android 11 and below) -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="maigbind_slots.xml" />
+</full-backup-content>
 ```
 
 ---

@@ -99,6 +99,7 @@ public class MaigBindVerifier(
     public fun verifyEnrollmentAttestation(request: EnrollmentRequest): EnrollmentAttestResponse {
         val findings = mutableListOf<Finding>()
         val now = clock.millis()
+        bindingStore.purgeExpiredPending(now)
 
         val (spkiBytes, challengeBytes) =
             decodeAndCheckChallenge(request, now, findings)
@@ -200,7 +201,12 @@ public class MaigBindVerifier(
         }
 
         enforceMaxActiveBindings(binding.accountId, binding.bindingId, now)
-        val activated = binding.copy(status = EnrollmentStatus.ACTIVE, activatedAtMillis = now)
+        val activated =
+            binding.copy(
+                status = EnrollmentStatus.ACTIVE,
+                activatedAtMillis = now,
+                pendingExpiresAtMillis = null,
+            )
         bindingStore.save(activated)
 
         return EnrollmentConfirmResponse(
@@ -243,6 +249,14 @@ public class MaigBindVerifier(
         require(accountId.isNotBlank()) { "accountId must not be blank" }
         return bindingStore.findActiveByAccount(accountId)
     }
+
+    /**
+     * Purges abandoned [EnrollmentStatus.PENDING_POP] bindings whose Proof-of-Possession window
+     * has elapsed.
+     *
+     * @return the number of expired pending bindings removed from the [BindingStore].
+     */
+    public fun purgeExpiredPendingEnrollments(): Int = bindingStore.purgeExpiredPending(clock.millis())
 
     /**
      * Issues a single-use transaction nonce bound to an active [keyId] for [accountId].
@@ -474,6 +488,8 @@ public class MaigBindVerifier(
                 AttestationSecurityLevel.SOFTWARE -> SecurityBacking.UNKNOWN
             }
         val bindingId = UUID.randomUUID().toString()
+        val popChallenge = ByteArray(32).also { random.nextBytes(it) }
+        val popExpiresAt = now + 60_000L
         bindingStore.save(
             DeviceBinding(
                 bindingId = bindingId,
@@ -485,10 +501,9 @@ public class MaigBindVerifier(
                 isRkpChain = isRkpChain,
                 issuerBatchKey = batchKey,
                 createdAtMillis = now,
+                pendingExpiresAtMillis = popExpiresAt,
             ),
         )
-        val popChallenge = ByteArray(32).also { random.nextBytes(it) }
-        val popExpiresAt = now + 60_000L
         challengeStore.saveChallenge(popChallengeKey(bindingId), popChallenge, popExpiresAt)
 
         findings +=
@@ -522,6 +537,15 @@ public class MaigBindVerifier(
     ): VerdictStatus? {
         if (request.popPayload.keyId != binding.keyId || request.popPayload.accountId != binding.accountId) {
             findings += critical(FindingCode.KEY_ID_MISMATCH, "PoP payload keyId/accountId mismatch")
+            return VerdictStatus.REJECTED_FRAUD_SIGNAL
+        }
+        val pendingExpiresAt = binding.pendingExpiresAtMillis
+        if (pendingExpiresAt != null && now > pendingExpiresAt) {
+            findings +=
+                critical(
+                    FindingCode.POP_CHALLENGE_INVALID_OR_EXPIRED,
+                    "Pending enrollment Proof-of-Possession window expired",
+                )
             return VerdictStatus.REJECTED_FRAUD_SIGNAL
         }
         val challengeBytes = runCatching { Base64Url.decode(request.popPayload.challenge) }.getOrNull()

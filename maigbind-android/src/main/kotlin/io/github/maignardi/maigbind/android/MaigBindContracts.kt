@@ -30,6 +30,21 @@ public enum class BiometricCapability {
     UNSUPPORTED,
 }
 
+/** Result of reconciling local active/pending key slots with the server's active `keyId`. */
+public enum class ReconciliationOutcome {
+    /** Local active key already matches the server's active `keyId`. */
+    UP_TO_DATE,
+
+    /** Local pending key matched the server's active `keyId` and was atomically promoted. */
+    PROMOTED_PENDING,
+
+    /** Neither local active nor pending key matches the server's active `keyId`; re-enrollment needed. */
+    NEEDS_RE_ENROLLMENT,
+
+    /** Server reports no active binding for this account; any stale local slots were cleared. */
+    NOT_ENROLLED,
+}
+
 /** Key generation artifact returned by [AndroidKeyStoreGateway]. */
 internal data class GeneratedKeyMaterial(
     val publicKeySpkiDer: ByteArray,
@@ -57,8 +72,13 @@ internal interface AndroidKeyStoreGateway {
     fun deleteKey(alias: String)
 }
 
-/** Tracks active and staged-pending Keystore aliases per hashed account without storing PII. */
+/**
+ * Tracks active and pending Keystore aliases per salted account hash using atomic slot promotion
+ * (`commit()` in a single preference transaction on Android).
+ */
 internal interface KeyAliasSlotStore {
+    fun getOrCreateInstallSalt(): ByteArray
+
     fun getActiveAlias(accountHash: String): String?
 
     fun setActiveAlias(
@@ -72,6 +92,12 @@ internal interface KeyAliasSlotStore {
         accountHash: String,
         alias: String?,
     )
+
+    /**
+     * Atomically promotes the pending alias to active and clears the pending slot in a single
+     * persistent transaction, returning the previous active alias (if any) so it can be deleted.
+     */
+    fun promotePendingToActive(accountHash: String): Pair<String?, String?>
 }
 
 /** Result delivered by [BiometricPromptLauncher] after displaying the OS biometric prompt. */

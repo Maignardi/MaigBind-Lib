@@ -41,11 +41,8 @@ class MaigBindInstrumentedTest {
     @Test
     fun hardwareKeyGenerationReportsStrongBoxOrFallsBackToTeeAndEnforcesBiometricInvalidation() =
         runTest {
-            val gateway = PlatformAndroidKeyStoreGateway()
-            val alias = "maigbind:instrumented-test"
-            gateway.deleteKey(alias)
-
             val sdk = MaigBind(context)
+            sdk.unenroll("instrumented-test")
             assumeTrue(
                 "Device must have BIOMETRIC_STRONG enrolled to test biometric-bound key generation",
                 sdk.getBiometricCapability() == BiometricCapability.READY_STRONG,
@@ -56,10 +53,19 @@ class MaigBindInstrumentedTest {
             val req = (result as MaigBindResult.Success).value
             assertTrue(req.securityBacking == SecurityBacking.STRONGBOX || req.securityBacking == SecurityBacking.TEE)
             assertTrue(req.attestationChainBase64Url.isNotEmpty())
+            assertFalse(sdk.hasEnrolledKey("instrumented-test"))
+            assertEquals(req.keyId, sdk.getPendingKeyId("instrumented-test"))
+
+            sdk.activatePendingEnrollment("instrumented-test")
             assertTrue(sdk.hasEnrolledKey("instrumented-test"))
 
             // Verify KeyInfo enforces biometric authentication, per-use validity, and invalidation on new enrollment
-            val privateKey = gateway.getPrivateKeyOrNull(alias)!!
+            val slotStore = SharedPrefsKeyAliasSlotStore(context)
+            val alias =
+                slotStore.getActiveAlias(
+                    MaigBind.accountHash("instrumented-test", slotStore.getOrCreateInstallSalt()),
+                )!!
+            val privateKey = PlatformAndroidKeyStoreGateway().getPrivateKeyOrNull(alias)!!
             val keyInfo =
                 KeyFactory
                     .getInstance(privateKey.algorithm, "AndroidKeyStore")

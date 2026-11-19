@@ -245,7 +245,7 @@ We evaluated `github.com/android/keyattestation` (Google's official Kotlin repla
 ## 8. Android Client Requirements (`maigbind-android`)
 
 - **minSdk:** `24` (Android 7.0 — first API level supporting hardware Key Attestation).
-- **Alias Isolation & Non-PII:** Keystore aliases use `maigbind:<sha256(accountId) prefix>:<randomTag>` (never raw email/CPF/PII). On re-enrollment, the new key is staged under a pending alias so an interrupted enrollment never destroys an active working key until `activatePendingEnrollment(accountId)` is called.
+- **Alias Isolation, Salted Non-PII & Crash-Safe Staging:** Keystore aliases use `maigbind:<sha256(installSalt || ":" || accountId) prefix>:<randomTag>` with a per-install 32-byte `SecureRandom` salt persisted in `maigbind_slots` (preventing brute-force reversal of low-entropy identifiers such as tax IDs/CPFs, and keeping raw PII out of Keystore). Every `enroll()` call (both initial and re-enrollment) stages the new key under a `pending` slot and leaves the `active` slot untouched until `activatePendingEnrollment(accountId)` atomically commits the promotion and deletes any superseded key. If the app crashes right after the server activates a binding, `reconcileActiveKey(accountId, serverActiveKeyId)` promotes the matching staged key on next startup.
 - **Key Generation (`KeyGenParameterSpec`):**
   - `KEY_ALGORITHM_EC`, `PURPOSE_SIGN`, `DIGEST_SHA256`, `ECGenParameterSpec("secp256r1")`.
   - `setUserAuthenticationRequired(true)`.

@@ -12,6 +12,7 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import io.github.maignardi.maigbind.core.Base64Url
 import io.github.maignardi.maigbind.core.SecurityBacking
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -21,6 +22,7 @@ import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.ProviderException
+import java.security.SecureRandom
 import java.security.Signature
 import java.security.spec.ECGenParameterSpec
 import kotlin.coroutines.resume
@@ -216,12 +218,42 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
     }
 }
 
-/** SharedPreferences-backed alias slot tracker keyed strictly by SHA-256 account hashes (no PII). */
+/**
+ * SharedPreferences-backed alias slot tracker keyed strictly by per-install salted SHA-256 account
+ * hashes (mitigating brute-force reversal of low-entropy identifiers such as national IDs/CPFs).
+ *
+ * Host apps with Android Auto Backup enabled should exclude `maigbind_slots.xml` in
+ * `data_extraction_rules.xml` / `backup_rules.xml`.
+ */
 internal class SharedPrefsKeyAliasSlotStore(
     context: Context,
 ) : KeyAliasSlotStore {
     private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences("maigbind_slots", Context.MODE_PRIVATE)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val saltLock = Any()
+
+    override fun getOrCreateInstallSalt(): ByteArray {
+        val existing = prefs.getString(KEY_INSTALL_SALT, null)
+        if (existing != null) {
+            return runCatching { Base64Url.decode(existing) }.getOrNull()?.takeIf { it.size == 32 }
+                ?: generateAndStoreSalt()
+        }
+        return synchronized(saltLock) {
+            val rechecked = prefs.getString(KEY_INSTALL_SALT, null)
+            if (rechecked != null) {
+                runCatching { Base64Url.decode(rechecked) }.getOrNull()?.takeIf { it.size == 32 }
+                    ?: generateAndStoreSalt()
+            } else {
+                generateAndStoreSalt()
+            }
+        }
+    }
+
+    private fun generateAndStoreSalt(): ByteArray {
+        val salt = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        prefs.edit().putString(KEY_INSTALL_SALT, Base64Url.encode(salt)).commit()
+        return salt
+    }
 
     override fun getActiveAlias(accountHash: String): String? = prefs.getString("active:$accountHash", null)
 
@@ -233,7 +265,7 @@ internal class SharedPrefsKeyAliasSlotStore(
             .edit()
             .apply {
                 if (alias == null) remove("active:$accountHash") else putString("active:$accountHash", alias)
-            }.apply()
+            }.commit()
     }
 
     override fun getPendingAlias(accountHash: String): String? = prefs.getString("pending:$accountHash", null)
@@ -246,7 +278,25 @@ internal class SharedPrefsKeyAliasSlotStore(
             .edit()
             .apply {
                 if (alias == null) remove("pending:$accountHash") else putString("pending:$accountHash", alias)
-            }.apply()
+            }.commit()
+    }
+
+    override fun promotePendingToActive(accountHash: String): Pair<String?, String?> {
+        val pending = prefs.getString("pending:$accountHash", null) ?: return null to null
+        val previousActive = prefs.getString("active:$accountHash", null)
+        // Commit both updates in a single atomic transaction so a process crash cannot leave
+        // active == pending and allow abortPendingEnrollment() to delete the active key.
+        prefs
+            .edit()
+            .putString("active:$accountHash", pending)
+            .remove("pending:$accountHash")
+            .commit()
+        return pending to previousActive
+    }
+
+    private companion object {
+        const val PREFS_NAME = "maigbind_slots"
+        const val KEY_INSTALL_SALT = "install_salt"
     }
 }
 

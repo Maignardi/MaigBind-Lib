@@ -2,6 +2,7 @@ package io.github.maignardi.maigbind.verifier
 
 import io.github.maignardi.maigbind.core.Base64Url
 import io.github.maignardi.maigbind.core.DomainTag
+import io.github.maignardi.maigbind.core.EnrollmentAttestResponse
 import io.github.maignardi.maigbind.core.EnrollmentConfirmRequest
 import io.github.maignardi.maigbind.core.EnrollmentPoPPayload
 import io.github.maignardi.maigbind.core.EnrollmentRequest
@@ -18,6 +19,7 @@ import io.github.maignardi.maigbind.core.computeKeyId
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.math.BigInteger
@@ -489,6 +491,97 @@ class MaigBindVerifierTest {
             )
         assertTrue(openResp.verdict.isVerified)
         assertTrue(openResp.verdict.findings.any { it.code == FindingCode.INFRA_FAIL_OPEN_APPLIED })
+    }
+
+    @Test
+    fun expiredPendingEnrollmentIsRejectedAndPurged() {
+        var nowInstant = fixedNow
+        val mutableClock =
+            object : Clock() {
+                override fun getZone() = ZoneOffset.UTC
+
+                override fun withZone(zone: java.time.ZoneId) = this
+
+                override fun instant() = nowInstant
+            }
+        val bindingStore = InMemoryBindingStore()
+        val rkpRoot = TestPkiFixture.createRootCa(fixedNow, isRkpP384 = true)
+        val verifier =
+            MaigBindVerifier(
+                trustStoreProvider = StaticTrustStoreProvider(listOf(rkpRoot.cert)),
+                revocationStatusProvider = StaticRevocationStatusProvider(),
+                bindingStore = bindingStore,
+                clock = mutableClock,
+            )
+
+        val (kp1, keyId1, attest1) =
+            attestPending(verifier, rkpRoot.cert, rkpRoot.keyPair.private, fixedNow, "acct-exp", 91L)
+        assertEquals(EnrollmentStatus.PENDING_POP, attest1.status)
+
+        nowInstant = fixedNow.plus(Duration.ofSeconds(61))
+        val expiredPop =
+            EnrollmentPoPPayload(
+                keyId = keyId1,
+                accountId = "acct-exp",
+                challenge = attest1.popChallengeBase64Url,
+                issuedAt = fixedNow.toEpochMilli(),
+                expiresAt = attest1.popExpiresAt,
+            )
+        val confirmResp =
+            verifier.confirmEnrollmentPop(
+                EnrollmentConfirmRequest(
+                    attest1.bindingId,
+                    expiredPop,
+                    Base64Url.encode(TestPkiFixture.ecdsaSign(kp1.private, expiredPop.signingInput())),
+                ),
+            )
+        assertFalse(confirmResp.verdict.isVerified)
+        assertTrue(confirmResp.verdict.findings.any { it.code == FindingCode.POP_CHALLENGE_INVALID_OR_EXPIRED })
+
+        val (_, keyId2, attest2) =
+            attestPending(verifier, rkpRoot.cert, rkpRoot.keyPair.private, nowInstant, "acct-exp", 92L)
+        assertEquals(0, verifier.purgeExpiredPendingEnrollments())
+        nowInstant = nowInstant.plus(Duration.ofSeconds(61))
+        assertEquals(1, verifier.purgeExpiredPendingEnrollments())
+        assertNull(bindingStore.findByBindingId(attest2.bindingId))
+        assertNull(bindingStore.findByAccountAndKeyId("acct-exp", keyId2))
+    }
+
+    private fun attestPending(
+        verifier: MaigBindVerifier,
+        rootCert: X509Certificate,
+        rootPrivate: java.security.PrivateKey,
+        at: Instant,
+        accountId: String,
+        serial: Long,
+    ): Triple<KeyPair, String, EnrollmentAttestResponse> {
+        val ch = verifier.beginEnrollment(accountId)
+        val kp = TestPkiFixture.generateP256KeyPair()
+        val keyId = computeKeyId(kp.public.encoded)
+        val leaf =
+            TestPkiFixture.createAttestedLeaf(
+                at,
+                rootCert,
+                rootPrivate,
+                "SHA384withECDSA",
+                kp,
+                BigInteger.valueOf(serial),
+                Base64Url.decode(ch.challengeBase64Url),
+                appPkg,
+                appCertDigest,
+            )
+        val attest =
+            verifier.verifyEnrollmentAttestation(
+                EnrollmentRequest(
+                    accountId,
+                    keyId,
+                    Base64Url.encode(kp.public.encoded),
+                    listOf(Base64Url.encode(leaf.encoded)),
+                    ch.challengeBase64Url,
+                    SecurityBacking.TEE,
+                ),
+            )
+        return Triple(kp, keyId, attest)
     }
 
     private fun enrollActiveDevice(): Triple<MaigBindVerifier, KeyPair, String> {

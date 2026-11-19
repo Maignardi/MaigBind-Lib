@@ -85,6 +85,13 @@ public data class RevokeBindingHttpResponse(
     val revokedCount: Int,
 )
 
+@Serializable
+public data class ActiveBindingHttpResponse(
+    val accountId: String,
+    val activeKeyId: String? = null,
+    val bindingId: String? = null,
+)
+
 public const val DEMO_VALID_STEP_UP_TOKEN: String = "stepup-mfa-verified"
 
 /**
@@ -167,6 +174,21 @@ private fun Route.enrollmentRoutes(
                 else -> throw IllegalArgumentException("Either bindingId or accountId must be provided")
             }
         call.respond(HttpStatusCode.OK, RevokeBindingHttpResponse(revokedCount = revoked))
+    }
+
+    get("/bindings/active") {
+        val accountId =
+            call.request.queryParameters["accountId"]?.takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException("Query parameter 'accountId' is required")
+        val active = verifier.getActiveBindings(accountId).firstOrNull()
+        call.respond(
+            HttpStatusCode.OK,
+            ActiveBindingHttpResponse(
+                accountId = accountId,
+                activeKeyId = active?.keyId,
+                bindingId = active?.bindingId,
+            ),
+        )
     }
 }
 
