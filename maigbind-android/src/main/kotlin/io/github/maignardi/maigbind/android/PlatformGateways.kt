@@ -47,6 +47,9 @@ import kotlin.coroutines.resume
 internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
     private val hmacLock = Any()
 
+    @Volatile
+    private var cachedHmacKey: SecretKey? = null
+
     override fun computeAccountHash(accountId: String): String {
         val secretKey = getOrCreateAliasHmacKey()
         val mac =
@@ -56,30 +59,38 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
         return mac.doFinal(accountId.encodeToByteArray()).toHexString().take(24)
     }
 
-    private fun getOrCreateAliasHmacKey(): SecretKey =
-        synchronized(hmacLock) {
+    private fun getOrCreateAliasHmacKey(): SecretKey {
+        cachedHmacKey?.let { return it }
+        return synchronized(hmacLock) {
+            cachedHmacKey?.let { return@synchronized it }
             val ks = loadKeyStore()
-            if (ks.containsAlias(HMAC_KEY_ALIAS)) {
-                val existing =
-                    runCatching { ks.getKey(HMAC_KEY_ALIAS, null) as? SecretKey }
-                        .getOrElse { ex ->
-                            throw IllegalStateException(
-                                "Keystore alias HMAC key '$HMAC_KEY_ALIAS' is corrupted; " +
-                                    "refusing to regenerate to avoid orphaning enrolled keys",
-                                ex,
-                            )
-                        }
-                return@synchronized existing
-                    ?: throw IllegalStateException(
-                        "Keystore alias HMAC key '$HMAC_KEY_ALIAS' returned null; " +
-                            "refusing to regenerate to avoid orphaning enrolled keys",
-                    )
-            }
-            val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256, ANDROID_KEYSTORE)
-            val spec = KeyGenParameterSpec.Builder(HMAC_KEY_ALIAS, KeyProperties.PURPOSE_SIGN).build()
-            keyGenerator.init(spec)
-            keyGenerator.generateKey()
+            val resolved =
+                if (ks.containsAlias(HMAC_KEY_ALIAS)) {
+                    val existing =
+                        runCatching { ks.getKey(HMAC_KEY_ALIAS, null) as? SecretKey }
+                            .getOrElse { ex ->
+                                throw IllegalStateException(
+                                    "Keystore alias HMAC key '$HMAC_KEY_ALIAS' is corrupted; " +
+                                        "call MaigBind.resetAll() to wipe local state and re-enroll",
+                                    ex,
+                                )
+                            }
+                    existing
+                        ?: throw IllegalStateException(
+                            "Keystore alias HMAC key '$HMAC_KEY_ALIAS' returned null; " +
+                                "call MaigBind.resetAll() to wipe local state and re-enroll",
+                        )
+                } else {
+                    val keyGenerator =
+                        KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256, ANDROID_KEYSTORE)
+                    val spec = KeyGenParameterSpec.Builder(HMAC_KEY_ALIAS, KeyProperties.PURPOSE_SIGN).build()
+                    keyGenerator.init(spec)
+                    keyGenerator.generateKey()
+                }
+            cachedHmacKey = resolved
+            resolved
         }
+    }
 
     override fun generateHardwareKey(
         alias: String,
@@ -230,9 +241,27 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
         }
 
     override fun deleteKey(alias: String) {
+        if (alias == HMAC_KEY_ALIAS) {
+            synchronized(hmacLock) { cachedHmacKey = null }
+        }
         val ks = loadKeyStore()
         if (ks.containsAlias(alias)) {
             ks.deleteEntry(alias)
+        }
+    }
+
+    override fun deleteAllMaigBindKeys() {
+        synchronized(hmacLock) {
+            cachedHmacKey = null
+            val ks = loadKeyStore()
+            val aliases = ks.aliases().toList().filter { it.startsWith(MAIGBIND_ALIAS_PREFIX) }
+            var firstFailure: Throwable? = null
+            for (alias in aliases) {
+                runCatching { ks.deleteEntry(alias) }.onFailure { ex ->
+                    if (firstFailure == null) firstFailure = ex
+                }
+            }
+            firstFailure?.let { throw it }
         }
     }
 
@@ -253,6 +282,7 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
 
     private companion object {
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        const val MAIGBIND_ALIAS_PREFIX = "maigbind:"
         const val HMAC_KEY_ALIAS = "maigbind:alias_hmac_v1"
         const val HMAC_ALGORITHM = "HmacSHA256"
     }
@@ -314,6 +344,8 @@ internal class SharedPrefsKeyAliasSlotStore(
             SlotPromotionResult.CommitFailed
         }
     }
+
+    override fun clearAll(): Boolean = prefs.edit().clear().commit()
 
     private companion object {
         const val PREFS_NAME = "maigbind_slots"

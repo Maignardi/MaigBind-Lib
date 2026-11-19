@@ -37,10 +37,11 @@ import javax.crypto.spec.SecretKeySpec
 @RunWith(RobolectricTestRunner::class)
 class MaigBindAndroidUnitTest {
     private class FakeKeyStoreGateway : AndroidKeyStoreGateway {
-        private val hmacKey = SecretKeySpec(ByteArray(32).also { SecureRandom().nextBytes(it) }, "HmacSHA256")
+        private var hmacKey = SecretKeySpec(ByteArray(32).also { SecureRandom().nextBytes(it) }, "HmacSHA256")
         val keys = mutableMapOf<String, Pair<KeyPair, SecurityBacking>>()
         var failStrongBoxWithUnavailable = false
         var simulateCorruptedHmacKey = false
+        var failNextDelete = false
 
         override fun computeAccountHash(accountId: String): String {
             if (simulateCorruptedHmacKey) {
@@ -87,7 +88,17 @@ class MaigBindAndroidUnitTest {
         ): SecurityBacking = keys[alias]?.second ?: SecurityBacking.UNKNOWN
 
         override fun deleteKey(alias: String) {
+            if (failNextDelete) {
+                failNextDelete = false
+                throw IllegalStateException("Simulated KeyStore deleteEntry failure")
+            }
             keys.remove(alias)
+        }
+
+        override fun deleteAllMaigBindKeys() {
+            keys.clear()
+            simulateCorruptedHmacKey = false
+            hmacKey = SecretKeySpec(ByteArray(32).also { SecureRandom().nextBytes(it) }, "HmacSHA256")
         }
     }
 
@@ -134,6 +145,16 @@ class MaigBindAndroidUnitTest {
             val prev = active[accountHash]
             active[accountHash] = p
             return SlotPromotionResult.Promoted(newActiveAlias = p, previousActiveAlias = prev)
+        }
+
+        override fun clearAll(): Boolean {
+            if (failNextCommit) {
+                failNextCommit = false
+                return false
+            }
+            active.clear()
+            pending.clear()
+            return true
         }
     }
 
@@ -205,6 +226,31 @@ class MaigBindAndroidUnitTest {
             ks1.simulateCorruptedHmacKey = true
             val corruptedRes = sdk1.enroll(cpf, Base64Url.encode(ByteArray(32) { 2 }))
             assertTrue((corruptedRes as MaigBindResult.Failure).error is MaigBindError.PlatformFailure)
+
+            // Escape hatch: resetAll() wipes keys/slots & regenerates HMAC key so enrollment recovers
+            assertTrue(sdk1.resetAll() is MaigBindResult.Success)
+            assertTrue(ks1.keys.isEmpty())
+            assertTrue(sdk1.enroll(cpf, Base64Url.encode(ByteArray(32) { 3 })) is MaigBindResult.Success)
+        }
+
+    @Test
+    fun unenrollDeletesKeystoreBeforeClearingSlotsToAvoidOrphanKeys() =
+        runTest {
+            val ks = FakeKeyStoreGateway()
+            val sdk = MaigBind(MaigBindConfig(), ks, FakeBiometricLauncher(), InMemorySlotStore())
+            enrollAndActivate(sdk, "user-unenroll", 1)
+            assertEquals(1, ks.keys.size)
+
+            ks.failNextDelete = true
+            val failedUnenroll = sdk.unenroll("user-unenroll")
+            assertTrue((failedUnenroll as MaigBindResult.Failure).error is MaigBindError.PlatformFailure)
+            // Slot must remain intact so retry can finish deleting the key instead of orphaning it
+            assertTrue(sdk.hasEnrolledKey("user-unenroll"))
+            assertEquals(1, ks.keys.size)
+
+            assertTrue(sdk.unenroll("user-unenroll") is MaigBindResult.Success)
+            assertFalse(sdk.hasEnrolledKey("user-unenroll"))
+            assertTrue(ks.keys.isEmpty())
         }
 
     @Test

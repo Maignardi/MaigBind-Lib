@@ -92,6 +92,9 @@ internal interface AndroidKeyStoreGateway {
     ): SecurityBacking
 
     fun deleteKey(alias: String)
+
+    /** Removes every MaigBind entry from `AndroidKeyStore` (including the alias HMAC key). */
+    fun deleteAllMaigBindKeys()
 }
 
 /**
@@ -119,6 +122,9 @@ internal interface KeyAliasSlotStore {
      * caller to delete any superseded key.
      */
     fun promotePendingToActive(accountHash: String): SlotPromotionResult
+
+    /** Clears all persisted account slots (`commit()`). */
+    fun clearAll(): Boolean
 }
 
 /** Result delivered by [BiometricPromptLauncher] after displaying the OS biometric prompt. */

@@ -268,12 +268,12 @@ public class MaigBind internal constructor(
      * Reconciles local active and pending key slots against the authoritative [serverActiveKeyIds]
      * returned by a **successful** backend query.
      *
-     * Important:
-     * - Never call this method when the backend query fails or times out; network errors must leave
-     *   local keys untouched.
-     * - Pass `emptySet()` only when the backend explicitly confirms zero active bindings. In that
-     *   case, any stale `active` key is cleared, while any staged `pending` key is **preserved** so
-     *   an in-flight `PENDING_POP` enrollment is never disrupted.
+     * @param accountId logical account identifier on the host app.
+     * @param serverActiveKeyIds authoritative set of active `keyId`s reported by your backend.
+     *   Passing `emptySet()` means **the server explicitly confirmed zero active bindings** —
+     *   **never** pass `emptySet()` when the server query failed, timed out, or returned an HTTP
+     *   error. When empty, only stale `active` keys are cleared; any staged `pending` key is
+     *   **preserved** so an in-flight `PENDING_POP` enrollment is never disrupted.
      */
     public suspend fun reconcileActiveKey(
         accountId: String,
@@ -384,6 +384,9 @@ public class MaigBind internal constructor(
 
     /**
      * Deletes both active and any pending hardware keys for [accountId] from `AndroidKeyStore`.
+     *
+     * Keystore entries are deleted before clearing preference slots so a transient Keystore
+     * deletion failure never leaves unreferenced orphan keys behind (allowing safe retry).
      */
     public suspend fun unenroll(accountId: String): MaigBindResult<Unit> =
         withContext(Dispatchers.IO) {
@@ -394,14 +397,36 @@ public class MaigBind internal constructor(
                 val hash = keyStoreGateway.computeAccountHash(accountId)
                 val active = aliasSlotStore.getActiveAlias(hash)
                 val pending = aliasSlotStore.getPendingAlias(hash)
+                active?.let { keyStoreGateway.deleteKey(it) }
+                if (pending != null && pending != active) {
+                    keyStoreGateway.deleteKey(pending)
+                }
                 if (!aliasSlotStore.setActiveAlias(hash, null) || !aliasSlotStore.setPendingAlias(hash, null)) {
                     return@withContext MaigBindResult.Failure(
                         MaigBindError.PlatformFailure("Failed to clear key slot entries"),
                     )
                 }
-                active?.let { keyStoreGateway.deleteKey(it) }
-                if (pending != null && pending != active) {
-                    keyStoreGateway.deleteKey(pending)
+                MaigBindResult.Success(Unit)
+            } catch (ex: Exception) {
+                MaigBindResult.Failure(mapPlatformException(ex))
+            }
+        }
+
+    /**
+     * Wipes all MaigBind Keystore entries (including the alias HMAC key) and all persisted slot
+     * pointers on this device installation.
+     *
+     * Use as an escape hatch if the device Keystore alias HMAC key becomes corrupted or if you want
+     * to completely reset all local bindings (users will then re-enroll via authenticated step-up).
+     */
+    public suspend fun resetAll(): MaigBindResult<Unit> =
+        withContext(Dispatchers.IO) {
+            return@withContext try {
+                keyStoreGateway.deleteAllMaigBindKeys()
+                if (!aliasSlotStore.clearAll()) {
+                    return@withContext MaigBindResult.Failure(
+                        MaigBindError.PlatformFailure("Failed to clear MaigBind preference slots"),
+                    )
                 }
                 MaigBindResult.Success(Unit)
             } catch (ex: Exception) {

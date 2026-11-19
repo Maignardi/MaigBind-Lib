@@ -217,6 +217,8 @@ if (activeResp != null) {
     }
 }
 
+when (val res = maigBind.resetAll()) { /* wipes local keys & HMAC alias if corrupted */ }
+
 // Signing a sensitive operation
 val keyId = maigBind.getEnrolledKeyId(accountId) ?: return startEnrollment()
 val payload = TransactionPayload(
