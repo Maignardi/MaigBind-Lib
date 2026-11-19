@@ -147,6 +147,7 @@ when (verdict.status) {
 ### 3. Android Client Integration (`maigbind-android`)
 
 ```kotlin
+// Instantiate once as an Application-scoped singleton (e.g., Hilt @Singleton / Koin single)
 val maigBind = MaigBind(
     context = applicationContext,
     config = MaigBindConfig(
@@ -217,8 +218,6 @@ if (activeResp != null) {
     }
 }
 
-when (val res = maigBind.resetAll()) { /* wipes local keys & HMAC alias if corrupted */ }
-
 // Signing a sensitive operation
 val keyId = maigBind.getEnrolledKeyId(accountId) ?: return startEnrollment()
 val payload = TransactionPayload(
@@ -254,7 +253,7 @@ when (
 #### Exhaustive Typed Error Handling
 
 ```kotlin
-fun handleMaigBindError(error: MaigBindError) {
+suspend fun handleMaigBindError(error: MaigBindError) {
     when (error) {
         is MaigBindError.NeedsReEnrollment -> {
             // New fingerprint/face was enrolled on the device -> KeyPermanentlyInvalidatedException
@@ -268,8 +267,17 @@ fun handleMaigBindError(error: MaigBindError) {
         is MaigBindError.UserNotAuthenticated -> showRetryPrompt()
         is MaigBindError.CryptoObjectTampered -> abortAndReportSecurityTelemetry()
         is MaigBindError.HardwareUnavailable -> showHardwareUnavailableMessage()
-        is MaigBindError.InvalidInput,
-        is MaigBindError.PlatformFailure -> showGenericError(error.message)
+        is MaigBindError.InvalidInput -> showGenericError(error.message)
+        is MaigBindError.PlatformFailure -> {
+            // e.g. IllegalStateException when AndroidKeyStore alias HMAC key is corrupted:
+            // wipe local keys/slots and send user back through step-up enrollment.
+            if (error.causeName == "IllegalStateException" && error.message.contains("resetAll")) {
+                maigBind.resetAll()
+                startStepUpEnrollment()
+            } else {
+                showGenericError(error.message)
+            }
+        }
     }
 }
 ```

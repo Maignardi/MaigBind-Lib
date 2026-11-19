@@ -45,18 +45,18 @@ import kotlin.coroutines.resume
  *   https://developer.android.com/reference/android/security/keystore/KeyGenParameterSpec.Builder#setDevicePropertiesAttestationIncluded(boolean)
  */
 internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
-    private val hmacLock = Any()
-
-    @Volatile
-    private var cachedHmacKey: SecretKey? = null
-
     override fun computeAccountHash(accountId: String): String {
         val secretKey = getOrCreateAliasHmacKey()
-        val mac =
-            Mac.getInstance(HMAC_ALGORITHM).apply {
-                init(secretKey)
-            }
-        return mac.doFinal(accountId.encodeToByteArray()).toHexString().take(24)
+        return try {
+            val mac =
+                Mac.getInstance(HMAC_ALGORITHM).apply {
+                    init(secretKey)
+                }
+            mac.doFinal(accountId.encodeToByteArray()).toHexString().take(24)
+        } catch (ex: Exception) {
+            synchronized(hmacLock) { cachedHmacKey = null }
+            throw ex
+        }
     }
 
     private fun getOrCreateAliasHmacKey(): SecretKey {
@@ -285,6 +285,11 @@ internal class PlatformAndroidKeyStoreGateway : AndroidKeyStoreGateway {
         const val MAIGBIND_ALIAS_PREFIX = "maigbind:"
         const val HMAC_KEY_ALIAS = "maigbind:alias_hmac_v1"
         const val HMAC_ALGORITHM = "HmacSHA256"
+
+        val hmacLock = Any()
+
+        @Volatile
+        var cachedHmacKey: SecretKey? = null
     }
 }
 

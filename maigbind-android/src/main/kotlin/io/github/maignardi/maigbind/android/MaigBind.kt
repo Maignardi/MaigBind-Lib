@@ -38,6 +38,8 @@ import java.util.UUID
  *   pending slot to `active` and delete any superseded key (or [abortPendingEnrollment] on failure).
  * - If the app crashes between server `ACTIVE` and [activatePendingEnrollment], call
  *   [reconcileActiveKey] on startup with the active `keyIds` returned by a successful server query.
+ *
+ * Host apps should instantiate [MaigBind] as an application-scoped singleton (e.g., via Hilt/Koin).
  */
 public class MaigBind internal constructor(
     private val config: MaigBindConfig,
